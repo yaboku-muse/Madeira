@@ -812,6 +812,13 @@ static void *wine_process_thread(void *arg) {
         // Skip check_command_line / reexec_loader
         setenv("WINELOADERNOEXEC", "1", 1);
 
+        // Enable the narrowly scoped MMDeviceEnumerator worker compatibility
+        // policy (ported from dre4moff r22: audio discovery worker crash fix).
+        // A madeira.cfg env override of 0 preserves standard COM rules.
+        setenv("MADEIRA_MMDEVICE_IMPLICIT_MTA", "1", 0);
+        dprintf(STDERR_FILENO, "[audio-com-policy] MMDevice implicit MTA=%s\n",
+                getenv("MADEIRA_MMDEVICE_IMPLICIT_MTA") ?: "0");
+
         // Set DLL search path to app bundle (contains aarch64-windows/ with PE DLLs)
         {
             NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
