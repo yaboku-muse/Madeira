@@ -151,6 +151,8 @@ jobs:
           for archive in build/ci-artifacts/*.tar.gz; do tar -xzf "$archive"; done
           test -s FEX/build-ios/include/FEXCore/Config/ConfigValues.inl
           test -s FEX/build-ios/include/FEXCore/Config/ConfigOptions.inl
+      - name: Fetch Wine Mono for the app bundle
+        run: bash build/wine-mono/fetch.sh
       - name: Build DXMT Metal side
         run: |
           xcodebuild -downloadComponent MetalToolchain
