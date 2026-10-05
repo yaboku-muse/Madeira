@@ -1,0 +1,40 @@
+name: FEX ARM64EC source rebuild
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arm64ec:
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v5
+      - name: Retrieve pinned Madeira FEX source
+        run: git submodule update --init --recursive --depth 1 FEX
+      - name: Fetch pinned Windows cross compiler
+        run: bash build/ci/fetch-mingw.sh
+      - name: Build ARM64EC guest translator from source
+        run: bash build/fex-arm64ec/build.sh
+      - name: Record PE metadata and source revision
+        run: |
+          mkdir -p build/ci-output/fex-guest
+          cp app/Madeira/arm64ec-windows/xtajit64.dll build/ci-output/fex-guest/
+          python3 tools/inspect-pe-imports.py build/ci-output/fex-guest/xtajit64.dll > build/ci-output/fex-guest/pe-metadata.json
+          git rev-parse HEAD > build/ci-output/fex-guest/madeira-commit.txt
+          git submodule status --recursive FEX > build/ci-output/fex-guest/fex-commits.txt
+          (cd build/ci-output/fex-guest && shasum -a 256 xtajit64.dll > xtajit64.dll.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ARM64EC-FEX-source-build
+          path: build/ci-output/fex-guest
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ARM64EC-FEX-build-errors
+          path: FEX/build-arm64ec/CMakeFiles/CMakeConfigureLog.yaml

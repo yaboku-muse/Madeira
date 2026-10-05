@@ -1,0 +1,54 @@
+name: Madeira host regressions
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Prepare Linux host compiler and generated Wine headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bison flex gcc-mingw-w64-x86-64 zlib1g-dev libfreetype-dev libssl-dev liblzma-dev
+          python3 -m pip install cryptography
+          mkdir -p wine/build-macos
+          cd wine/build-macos
+          ../configure --enable-archs=x86_64 --without-x --disable-tests --enable-winegstreamer
+          make -j4 include/all
+      - name: Run Linux host checks
+        run: python3 build/ci/host-regressions.py --platform linux
+      - name: Verify real Valve runtime archives and upgrade metadata
+        run: python3 build/ci/verify-steam-runtime.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: host-regression-results-linux
+          path: build/ci-output/host-tests
+          retention-days: 30
+  apple-host:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Run host checks using Apple Swift modules
+        run: python3 build/ci/host-regressions.py --platform macos
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: host-regression-results-macos
+          path: build/ci-output/host-tests
+          retention-days: 30

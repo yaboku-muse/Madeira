@@ -1,0 +1,49 @@
+name: Wine and DXMT i386 source rebuild
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  i386:
+    runs-on: macos-26
+    timeout-minutes: 240
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      JOBS: '2'
+    steps:
+      - uses: actions/checkout@v5
+      - name: Retrieve pinned Madeira Wine and DXMT sources
+        run: git submodule update --init --recursive --depth 1 wine dxmt
+      - name: Install build tools
+        run: brew install bison meson ninja
+      - name: Fetch pinned Windows cross compiler
+        run: bash build/ci/fetch-mingw.sh
+      - name: Build complete i386 farm and check import closure
+        run: |
+          export PATH="$(brew --prefix bison)/bin:$PATH"
+          bash build/wine-i386/build.sh
+      - name: Record source revisions and output hashes
+        run: |
+          mkdir -p build/ci-output/wine-i386
+          tar -czf build/ci-output/wine-i386/i386-windows.tar.gz app/Madeira/i386-windows
+          git rev-parse HEAD > build/ci-output/wine-i386/madeira-commit.txt
+          git submodule status --recursive wine dxmt > build/ci-output/wine-i386/component-commits.txt
+          (cd app/Madeira/i386-windows && find . -type f ! -name .gitkeep -exec shasum -a 256 {} \;) > build/ci-output/wine-i386/module-sha256.txt
+          (cd build/ci-output/wine-i386 && shasum -a 256 i386-windows.tar.gz > i386-windows.tar.gz.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Wine-DXMT-i386-source-build
+          path: build/ci-output/wine-i386
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Wine-DXMT-i386-build-logs
+          path: |
+            wine/build-i386/config.log
+            wine/build-i386/madeira-i386-build.log
+            dxmt/build-pe-i386/meson-logs/meson-log.txt
+          retention-days: 30
