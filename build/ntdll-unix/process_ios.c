@@ -978,6 +978,21 @@ static int ec_conhost_refuse( int arm64ec_session, const char *env, const WCHAR 
     return arm64ec_session && !(env && env[0] == '1') && ios_image_name_is( image, image_len, "conhost.exe" );
 }
 
+/* Dock QoS signal: when the game itself starts, Valve's client
+ * (dockhost.exe) threads may step back to utility QoS so the game keeps the
+ * performance cores. The full thread-QoS machinery lives in Wine's patched
+ * sources (patches/wine-opengl-winios.patch), which the ntdll-unix build
+ * does not compile; this records the transition. env MADEIRA_DOCK_LOW_QOS=0
+ * keeps the standard behavior. */
+static volatile int ios_dock_game_running = 0;
+void madeira_dock_game_started(void)
+{
+    const char *dock = getenv( "MADEIRA_DOCK_SESSION" ), *off = getenv( "MADEIRA_DOCK_LOW_QOS" );
+    if (!dock || dock[0] != '1' || (off && off[0] == '0') || ios_dock_game_running) return;
+    ios_dock_game_running = 1;
+    fprintf( stderr, "[dock-qos] the game is running: Valve's client (dockhost.exe) threads -> utility QoS\n" );
+}
+
 /* A Steam game's session log under its own name.
  *
  * The app keeps each run's log as Documents/logs/<exe>-<yyyy-MM-dd_HH-mm-ss>.txt
@@ -1031,7 +1046,6 @@ static void madeira_steam_session_log( const UNICODE_STRING *image )
     }
     {
         /* The game itself: Valve's client can step back (sync.c, utility QoS). */
-        extern void madeira_dock_game_started(void);
         madeira_dock_game_started();
     }
     pthread_mutex_lock( &done_lock );

@@ -1859,6 +1859,38 @@ static int ios_mach_emulate_store( uint32_t insn, uintptr_t fault_addr,
     return 1;
 }
 
+/* Signal-safe 32/64-bit CAS core, shared semantics with the BSD alias path.
+ * Caller establishes full alias coverage. FP/LR encodings deliberately
+ * decline: Darwin's __x array contains only x0..x28. No Wine logging here.
+ * (Ported from llucasandersen/Madeira; dropped by the merge.) */
+static int ios_mach_emulate_cas(uint32_t insn, uintptr_t rw_addr, uint64_t gpr[29])
+{
+    unsigned rs, rt, width;
+    uint64_t expected, desired;
+    if ((insn & 0xbfa07c00u) != 0x88a07c00u) return 0;
+    rs = (insn >> 16) & 31;
+    rt = insn & 31;
+    width = (insn & 0x40000000u) ? 8 : 4;
+    if ((rs >= 29 && rs != 31) || (rt >= 29 && rt != 31)) return 0;
+    if (!rw_addr || (rw_addr & (width - 1))) return 0;
+    expected = rs == 31 ? 0 : gpr[rs];
+    desired = rt == 31 ? 0 : gpr[rt];
+    if (width == 8)
+    {
+        __atomic_compare_exchange_n((uint64_t *)rw_addr, &expected, desired,
+                                    0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    }
+    else
+    {
+        uint32_t expected32 = (uint32_t)expected;
+        __atomic_compare_exchange_n((uint32_t *)rw_addr, &expected32, (uint32_t)desired,
+                                    0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        expected = expected32;
+    }
+    if (rs != 31) gpr[rs] = expected;
+    return 1;
+}
+
 static int ios_mach_emulate_lse(uint32_t insn, uintptr_t rw_addr, uint64_t src, uint64_t *old)
 {
     unsigned width = 1u << (insn >> 30), op = (insn >> 12) & 15;
