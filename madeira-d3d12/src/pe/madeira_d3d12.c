@@ -6263,7 +6263,12 @@ static void mad_mheap_reclaim(struct mad_device *d, int all) {
     obj_handle_t done_list[64]; void *done_mem[64]; unsigned nd = 0, i = 0;
     UINT64 done;
     if (!d) return;
-    done = mad_gpu_completed(d);
+    /* Teardown drains everything; it must not query a timeline that may have
+     * already been removed. Normal reclamation still waits for GPU progress.
+     * (Ported from dre4moff r20: D3D12 startup device lifetime.) */
+    done = all ? ~(UINT64)0 : mad_gpu_completed(d);
+    do {
+    nd = 0; i = 0;
     EnterCriticalSection(&d->heap_lock);
     while (i < d->nmhret && nd < 64) {
         if (all || d->mhret[i].serial + 2 <= done) { done_list[nd] = d->mhret[i].heap; done_mem[nd++] = d->mhret[i].mem; d->mhret[i] = d->mhret[--d->nmhret]; }
@@ -6274,6 +6279,7 @@ static void mad_mheap_reclaim(struct mad_device *d, int all) {
         if (done_list[i]) { mad_unresident(d, done_list[i]); NSObject_release(done_list[i]); }
         if (done_mem[i]) VirtualFree(done_mem[i], 0, MEM_RELEASE);   /* ml1154: a file-backed CPU-visible buffer's storage */
     }
+    } while (all && d->nmhret);  /* bounded batches, including more than 64 heaps */
 }
 static void mad_hp_reclaim_locked(struct mad_device *d) {
     UINT64 done = mad_gpu_completed(d); unsigned i = 0;
