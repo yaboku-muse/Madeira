@@ -46,6 +46,23 @@ compile_one() {
     fi
 }
 
+# Recompile just the signal bridge, preserving all unrelated engine objects.
+# Useful for a dump-policy change without rebuilding network/crypto modules.
+if [ "${MADEIRA_ONLY:-}" = "signal_arm64" ] || [ "${MADEIRA_ONLY:-}" = "audio_null_ios" ]; then
+    test -f "$APP_LIB" && test -f "$WINE_BUILD/include/config.h"
+    if [ "$MADEIRA_ONLY" = "audio_null_ios" ]; then
+        compile_one "$BUILD_DIR/audio_null_ios.c" "audio_null_ios"
+    else
+        compile_one "$BUILD_DIR/signal_arm64_ios.c" "signal_arm64"
+    fi
+    [ "$FAILED" -eq 0 ]
+    cp "$APP_LIB" "$OBJ_DIR/libntdll_unix.a"
+    xcrun ar r "$OBJ_DIR/libntdll_unix.a" "$OBJ_DIR/$MADEIRA_ONLY.o"
+    xcrun ranlib "$OBJ_DIR/libntdll_unix.a"
+    cp "$OBJ_DIR/libntdll_unix.a" "$APP_LIB"
+    exit 0
+fi
+
 # iOS-Madeira 2026-07-05 (Steam S0): compile a DLL's unix side into
 # libntdll_unix.a. Args: src, obj-name, funcs-prefix, extra flags...
 # The __wine_unix_call_funcs tables are renamed per-lib (they'd collide
@@ -194,7 +211,11 @@ for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
             compile_one "$BUILD_DIR/virtual_ios.c" "virtual"
             ;;
         signal_arm64)
-            compile_one "$BUILD_DIR/signal_arm64_ios.c" "signal_arm64"
+            if [ "$MADEIRA_ONLY" = "audio_null_ios" ]; then
+        compile_one "$BUILD_DIR/audio_null_ios.c" "audio_null_ios"
+    else
+        compile_one "$BUILD_DIR/signal_arm64_ios.c" "signal_arm64"
+    fi
             ;;
         thread)
             compile_one "$BUILD_DIR/thread_ios.c" "thread"
