@@ -246,6 +246,12 @@ struct ContentDecryptor {
 
     // MARK: - Full pipeline
 
+    struct ProcessingTiming: Sendable {
+        var decrypt = 0.0
+        var decompress = 0.0
+        var checksum = 0.0
+    }
+
     /// Decrypts, decompresses and checks a chunk (the checksum is skipped
     /// when the manifest gives none).
     static func processChunk(
@@ -254,11 +260,32 @@ struct ContentDecryptor {
         expectedCRC: UInt32,
         expectedSize: Int
     ) throws -> Data {
-        let decrypted = try decryptChunk(encryptedData: encryptedData, depotKey: depotKey)
-        let decompressed = try decompressChunk(compressedData: decrypted, expectedSize: expectedSize)
+        var timing = ProcessingTiming()
+        return try processChunk(encryptedData: encryptedData, depotKey: depotKey,
+                                expectedCRC: expectedCRC, expectedSize: expectedSize, timing: &timing)
+    }
 
-        if expectedCRC != 0, adler32(decompressed) != expectedCRC {
-            throw SteamError.checksumMismatch
+    /// Records monotonic stage durations, including work before a thrown error.
+    static func processChunk(
+        encryptedData: Data, depotKey: Data, expectedCRC: UInt32, expectedSize: Int,
+        timing: inout ProcessingTiming
+    ) throws -> Data {
+        let decrypted: Data
+        do {
+            let start = ProcessInfo.processInfo.systemUptime
+            defer { timing.decrypt += ProcessInfo.processInfo.systemUptime - start }
+            decrypted = try decryptChunk(encryptedData: encryptedData, depotKey: depotKey)
+        }
+        let decompressed: Data
+        do {
+            let start = ProcessInfo.processInfo.systemUptime
+            defer { timing.decompress += ProcessInfo.processInfo.systemUptime - start }
+            decompressed = try decompressChunk(compressedData: decrypted, expectedSize: expectedSize)
+        }
+        if expectedCRC != 0 {
+            let start = ProcessInfo.processInfo.systemUptime
+            defer { timing.checksum += ProcessInfo.processInfo.systemUptime - start }
+            if adler32(decompressed) != expectedCRC { throw SteamError.checksumMismatch }
         }
 
         return decompressed

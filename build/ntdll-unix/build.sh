@@ -210,6 +210,10 @@ echo "Results: $SUCCEEDED succeeded, $FAILED failed"
 if [ -n "$FAILED_FILES" ]; then
     echo "Failed:$FAILED_FILES"
 fi
+if [ "$FAILED" -ne 0 ]; then
+    echo "Compilation failed; not assembling or staging an archive from partial or stale objects." >&2
+    exit 1
+fi
 
 echo ""
 echo "=== Building libntdll_unix.a ==="

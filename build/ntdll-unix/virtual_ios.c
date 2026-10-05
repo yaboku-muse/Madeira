@@ -2867,6 +2867,23 @@ size_t ios_jit_pool_size_global = 0;
 unsigned long long ios_last_footprint_mb = 0;   /* ml668: latest phys_footprint MB (decl above) */
 int ios_fast_footprint = 0;                    /* ml670: set when d3d11 loads */
 
+/* Conservative pool frontier, not committed/live code or physical footprint.
+ * UIKit/background telemetry must not enter Wine's virtual critical section.
+ * The head lock is independent of it; tail reservations are atomic. */
+void ios_jit_pool_usage( uint64_t *reserved, uint64_t *capacity )
+{
+    size_t head, tail, total;
+    pthread_mutex_lock( &ios_pool_lock );
+    head = jit_pool_offset;
+    tail = __sync_fetch_and_add( &ios_jit_tail_reserved, 0 );
+    total = __atomic_load_n( &ios_jit_pool_size_global, __ATOMIC_ACQUIRE );
+    pthread_mutex_unlock( &ios_pool_lock );
+    if (head > total) head = total;
+    if (tail > total - head) tail = total - head;
+    if (reserved) *reserved = (uint64_t)(head + tail);
+    if (capacity) *capacity = (uint64_t)total;
+}
+
 /* TEB restore trampoline in JIT pool.
  * iOS sigreturn does NOT restore x18 from the ucontext — it always zeroes
  * the platform register. So we can't fix x18 via signal handler return.
@@ -6956,6 +6973,10 @@ static size_t   ios_exe_win_img_size;
 static void    *ios_exe_win_img_peb;
 static int      ios_exe_win_img_dead;
 static unsigned ios_exe_win_generation;
+/* Retained while the unmapped interval awaits THIS owner's pool cleanup.
+ * Another exiting helper must not publish readiness for this generation. */
+static void    *ios_exe_win_retiring_peb;
+static unsigned ios_exe_win_retiring_generation;
 
 /* ml988: ownership state machine for the fixed-base executable window.
  *
@@ -7286,28 +7307,46 @@ void ios_exe_win_commit_claim( void *base, size_t size, int mapped )
  * where the owning PEB and the main module base are both known. */
 void ios_exe_win_note_owner( void *module, void *owner_peb )
 {
+    size_t size = 0;
+    unsigned gen = 0;
     if (!module || !owner_peb) return;
-    if (module != ios_exe_win_img_base) return;
-    if (ios_exe_win_img_peb == owner_peb) return;
-    ios_exe_win_img_peb = owner_peb;
-    dprintf( 2, "ml983: gen %u's image %p+%#lx is owned by peb=%p\n", ios_exe_win_generation,
-             ios_exe_win_img_base, (unsigned long)ios_exe_win_img_size, owner_peb );
+    pthread_mutex_lock( &ios_exewin_lock );
+    /* Publication belongs to the successfully mapped, still-unbound occupant.
+     * A late boot callback cannot replace an established owner's identity. */
+    if (ios_exewin_st == IOS_EXEWIN_OWNED && module == ios_exe_win_img_base &&
+        !ios_exe_win_img_dead && !ios_exe_win_img_peb)
+    {
+        ios_exe_win_img_peb = owner_peb;
+        size = ios_exe_win_img_size;
+        gen = ios_exe_win_generation;
+    }
+    pthread_mutex_unlock( &ios_exewin_lock );
+    if (gen) dprintf( 2, "ml983: gen %u's image %p+%#lx is owned by peb=%p\n",
+                      gen, module, (unsigned long)size, owner_peb );
 }
 
 /* ml983: the occupant's pseudo-process has been reclaimed. Called from
  * ios_jit_reclaim_process, which by then has tombstoned every pool mapping and
- * retired every anon alias belonging to that PEB -- a stronger quiescence
- * statement than server EOF, because no FEX-translated code of that process can
- * be entered any more. */
+ * retired every anon alias belonging to that PEB. This publishes completion of
+ * that allocator walk; it does not prove all native peer threads have stopped. */
 static void ios_exe_win_note_dead_peb( void *dead_peb )
 {
-    if (!dead_peb || !ios_exe_win_img_base) return;
-    if (dead_peb != ios_exe_win_img_peb || ios_exe_win_img_dead) return;
-    ios_exe_win_img_dead = 1;
-    dprintf( 2, "ml983: gen %u's window occupant %p+%#lx is now ownerless (peb=%p reclaimed) -- "
-             "the window can be re-granted to the next >=64MB fixed map\n",
-             ios_exe_win_generation, ios_exe_win_img_base,
-             (unsigned long)ios_exe_win_img_size, dead_peb );
+    void *base = NULL;
+    size_t size = 0;
+    unsigned gen = 0;
+    if (!dead_peb) return;
+    pthread_mutex_lock( &ios_exewin_lock );
+    if (ios_exe_win_img_base && dead_peb == ios_exe_win_img_peb && !ios_exe_win_img_dead)
+    {
+        ios_exe_win_img_dead = 1;
+        base = ios_exe_win_img_base;
+        size = ios_exe_win_img_size;
+        gen = ios_exe_win_generation;
+    }
+    pthread_mutex_unlock( &ios_exewin_lock );
+    if (gen) dprintf( 2, "ml983: gen %u's window occupant %p+%#lx is now ownerless (peb=%p reclaimed) -- "
+                     "the window can be re-granted to the next >=64MB fixed map\n",
+                     gen, base, (unsigned long)size, dead_peb );
 }
 
 static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags )
@@ -10304,12 +10343,9 @@ void ios_jit_reclaim_process( void *peb )
                 maps_killed, aliases_killed,
                 (unsigned long)jit_pool_offset, ios_pool_free_count);
 
-    /* ml983: only now is the fixed-base window occupant safe to retire. This is
-     * deliberately AFTER the ledger walk, not before it: the flag is what lets
-     * another thread delete that image view, and it must not be observable while
-     * this PEB's pool mappings and anon aliases are still live -- otherwise the
-     * view could go while FEX-translated code referring to it is still entrant.
-     * Server EOF alone would not carry that guarantee; completing this walk does. */
+    /* Publish allocator retirement only AFTER the ledger walk has removed this
+     * PEB's mappings and aliases. This flag does not establish native peer-thread
+     * quiescence; that lifetime requirement remains separate from the walk. */
     ios_exe_win_note_dead_peb( peb );
 }
 
@@ -12473,7 +12509,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 /* Export for SIGBUS handler */
                 ios_jit_rx_base_global = jit_rx_base;
                 ios_jit_rw_base_global = jit_rw_base;
-                ios_jit_pool_size_global = jit_pool_size;
+                __atomic_store_n( &ios_jit_pool_size_global, jit_pool_size, __ATOMIC_RELEASE );
 
                 /* ml91 (task #35): dump the VA map ONCE here, unconditionally.
                  * The first cut only probed on jumbo-reserve failure, so a
@@ -12511,7 +12547,9 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     ios_jit_teb_trampoline = (char *)jit_rx_base + 8;
                     /* Page-align the offset so PE images stay page-aligned
                      * (mprotect requires page-aligned addresses). */
+                    pthread_mutex_lock( &ios_pool_lock );
                     jit_pool_offset = 0x4000;  /* one 16KB iOS page */
+                    pthread_mutex_unlock( &ios_pool_lock );
                     ERR("iOS JIT: TEB trampoline at %p (pool+8)\n", ios_jit_teb_trampoline);
                 }
 
@@ -25996,6 +26034,8 @@ void ios_retire_own_fixed_base_image( void *dying_peb )
     ios_exe_win_img_size  = 0;
     ios_exe_win_img_peb   = NULL;
     ios_exe_win_img_dead  = 0;
+    ios_exe_win_retiring_peb = dying_peb;
+    ios_exe_win_retiring_generation = gen;
     ios_exewin_st         = IOS_EXEWIN_HELD_NOT_READY;
     pthread_mutex_unlock( &ios_exewin_lock );
 
@@ -26021,11 +26061,18 @@ void ios_retire_own_fixed_base_image( void *dying_peb )
 void ios_exe_win_mark_ready( void *dead_peb )
 {
     int promoted = 0;
+    void *base = NULL;
+    size_t size = 0;
 
     pthread_mutex_lock( &ios_exewin_lock );
-    if (ios_exewin_st == IOS_EXEWIN_HELD_NOT_READY)
+    if (dead_peb && ios_exewin_st == IOS_EXEWIN_HELD_NOT_READY &&
+        dead_peb == ios_exe_win_retiring_peb &&
+        ios_exe_win_retiring_generation == ios_exe_win_generation)
     {
         ios_exewin_st = IOS_EXEWIN_HELD_READY;
+        base = ios_exe_win_held_base;
+        size = ios_exe_win_held_size;
+        ios_exe_win_retiring_peb = NULL;
         promoted = 1;
     }
     pthread_mutex_unlock( &ios_exewin_lock );
@@ -26033,7 +26080,7 @@ void ios_exe_win_mark_ready( void *dead_peb )
     if (promoted)
         dprintf( 2, "ml988: pool mappings for peb=%p reclaimed -- %p+%#lx HELD_NOT_READY -> "
                  "HELD_READY; the next >=64MB fixed-base map may take it\n",
-                 dead_peb, ios_exe_win_held_base, (unsigned long)ios_exe_win_held_size );
+                 dead_peb, base, (unsigned long)size );
 }
 
 /***********************************************************************

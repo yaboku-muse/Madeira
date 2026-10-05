@@ -217,6 +217,7 @@ enum SteamDirectStart {
         var program: String
         var arguments: String
         var folder: String?
+        var launchID: Int? = nil
     }
 
     /// Launch types Steam gives entries that are not the game itself.
@@ -298,7 +299,8 @@ enum SteamDirectStart {
                     folder = found
                 }
             }
-            return Choice(program: program, arguments: option.arguments.trimmingCharacters(in: spaces), folder: folder)
+            return Choice(program: program, arguments: option.arguments.trimmingCharacters(in: spaces), folder: folder,
+                          launchID: option.launchID)
         }
         return nil
     }
@@ -623,7 +625,16 @@ struct SteamGamesSection: View {
     private func cell(_ item: SteamGamesRules.Item, list: Bool, dense: Bool) -> some View {
         Button { select(item) } label: { SteamGameCell(item: item, list: list, dense: dense) }
             .libraryCardButtonStyle(grid: !list)
-            .libraryHideMenu(LibraryHidden.steam(item.id))
+            .contextMenu {
+                if libraryEnabled, item.owned != nil {
+                    Button("Download options") { selected = SteamGameSelection(id: item.id) }
+                }
+                let hiddenKey = LibraryHidden.steam(item.id)
+                let hidden = LibraryHidden.shared.contains(hiddenKey)
+                Button(hidden ? "Show in library" : "Hide from library", systemImage: hidden ? "eye" : "eye.slash") {
+                    withAnimation(.snappy(duration: 0.25)) { LibraryHidden.shared.toggle(hiddenKey) }
+                }
+            }
     }
 
     /// An installed game (by Madeira's download or by Steam's client) opens its
@@ -967,6 +978,21 @@ struct SteamGameSheet: View {
                     Section {
                         Link(destination: URL(string: "https://store.steampowered.com/app/\(appID)/")!) {
                             Label("View in the Steam Store", systemImage: "safari")
+                        }
+                    }
+                    Section {
+                        DisclosureGroup("Download speed measurement") {
+                            Text("Downloads three samples of up to 64 MiB from this game's Steam content server. Keep Madeira open. Game files are unchanged.")
+                                .font(.footnote).foregroundStyle(.secondary)
+                            if steam.controlAppID != nil {
+                                Button("Cancel measurement") { steam.cancelNativeControl() }
+                            } else {
+                                Button("Measure native download speed") { steam.startNativeControl(appID) }
+                                    .disabled(!steam.signedIn || steam.hasActiveDownload)
+                            }
+                            if !steam.controlStatus.isEmpty {
+                                Text(steam.controlStatus).font(.footnote)
+                            }
                         }
                     }
                 } else {

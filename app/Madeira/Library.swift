@@ -227,6 +227,9 @@ struct LibraryEntry: Codable, Identifiable {
     var controlLayout: String?
     var lastPlayed: Date?
     var graphicsAPI: String?
+    /// nil/true enables evidence-backed automatic compatibility profiles.
+    /// This is independent of the import-derived graphicsAPI label above.
+    var automaticCompatibility: Bool?
     var folderBytes: Int64?
     var metadataChecked: Date?
     var metadataRevision: Int?
@@ -2658,6 +2661,11 @@ struct LibraryDetail: View {
                 }
                 Section {
                     Toggle("Reduced-precision x87", isOn: $entry.reducedX87)
+                    if entry.steamAppID != nil {
+                        Toggle("Automatic compatibility profile", isOn: Binding(
+                            get: { entry.automaticCompatibility != false },
+                            set: { entry.automaticCompatibility = $0 ? nil : false }))
+                    }
                     // Exported for this game only when chosen (applyEnvironment).
                     Toggle("AVX and AVX2", isOn: Binding(get: { entry.avx ?? false }, set: { entry.avx = $0 ? true : nil }))
                     // Exported for this game only when chosen (applyEnvironment).
@@ -3432,7 +3440,8 @@ struct LibraryHUD: View {
                 if dockStart.failure == nil { ProgressView().tint(.white) }
                 if let failure = dockStart.failure {
                     Text("Madeira Dock stopped").font(.headline)
-                    Text(failure).font(.caption).multilineTextAlignment(.center).frame(maxWidth: 360)
+                    Text(failure + (dockStart.loaderDiagnostic.map { "\n" + $0 } ?? ""))
+                        .font(.caption).multilineTextAlignment(.center).frame(maxWidth: 360)
                 } else if dockStart.active {
                     // What the Dock start is waiting for, from the host's report, and what it
                     // does with the game's one-time installs.
@@ -3516,6 +3525,10 @@ struct LibraryHUD: View {
             let progress = DockInstallers.poll(drive: MadeiraDock.drive)
             // The host starts at once, or after this start's one-time installs finished.
             let hostDue = DockInstallers.finishedAt ?? model.launchStartedAt
+            if let warning = dockStart.progressWarning {
+                return warning + (dockStart.loaderDiagnostic.map { "\n" + $0 } ?? "")
+            }
+            if let created = dockStart.executableStatus { return created }
             return DockStartStatus.text(MadeiraDock.pollReport().fields, installers: DockInstallers.script != nil,
                                         installerProgress: progress, installsFinished: DockInstallers.finishedAt != nil,
                                         waited: Date().timeIntervalSince(hostDue))

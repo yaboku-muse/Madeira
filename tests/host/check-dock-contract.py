@@ -36,6 +36,13 @@ installers = (app / 'DockInstallers.swift').read_text()
 # ------------------------------------------------------------------ static
 for name, text in [('MadeiraDock.swift', dock), ('MadeiraDockView.swift', view), ('SteamRuntime.swift', runtime),
                    ('DockInstallers.swift', installers)]:
+    if name == 'SteamRuntime.swift':
+        # Verified package metadata names files, but does not select launch
+        # behavior by program name. Exclude only these literal SHA dictionaries;
+        # CI cross-checks every entry against the actual pinned Valve archives.
+        metadata = r'static let (?:legacyFileSHA256|criticalFileSHA256): \[String: String\] = \[\n(?:        "[^"\n]+": "[0-9a-f]{64}",\n)+    \]'
+        require(len(re.findall(metadata, text)) == 2, 'runtime hash inventories contain literal SHA metadata only')
+        text = re.sub(metadata, '', text)
     literals = set(re.findall(r'"([^"\n]*?\.exe)\\?"', text)) | set(re.findall(r'\\"([^"\n]*?\.exe)\\"', text))
     names = {l.replace('/', '\\').split('\\')[-1].lower() for l in literals}
     # DockInstallers.swift checks the ".exe" suffix of install-script programs and whether the
@@ -83,7 +90,7 @@ if git.returncode == 0:
                               'app/Madeira/arm64ec-windows/dock-notices.txt'], capture_output=True, text=True).stdout.strip()
     require(tracked == '', 'no built Dock executable or notices are tracked')
     gitlink = subprocess.run(['git', '-C', str(root), 'ls-files', '-s', 'madeira-dock'], capture_output=True, text=True).stdout
-    require(gitlink.startswith('160000 0c5bbd1a854c4c63c47e074b72954aba5b36919d'), 'madeira-dock is pinned at 0c5bbd1')
+    require(gitlink.startswith('160000 4583f82d3669ed8234139d42185addce137f5cfd'), 'madeira-dock is pinned at the numbered launch-option fix 4583f82')
 else:
     print('SKIP: not a usable git checkout here; tracked-binary and submodule-pin checks not run')
 
@@ -203,6 +210,11 @@ func jwt(_ claims: String) -> String {
         // Host environment and launch.
         setenv("MADEIRA_STEAM_HOST_ACCOUNT", "stale", 1); setenv("MADEIRA_STEAM_HOST_STEAMID", "1", 1)
         MadeiraDock.configure(game)
+        require(MadeiraDock.launchImage == nil, "unknown selected image has no creation match")
+        MadeiraDock.configure(game, expectedImage: game.windowsInstallPath + "\\game.exe")
+        require(MadeiraDock.launchImage == game.windowsInstallPath + "\\game.exe", "selected image is retained for diagnostic matching")
+        MadeiraDock.configure(game)
+        require(MadeiraDock.launchImage == nil, "next launch clears stale expected image")
         require(["MADEIRA_STEAM_HOST_PROBE", "MADEIRA_STEAM_HOST_SESSION", "MADEIRA_STEAM_HOST_LOGIN", "MADEIRA_STEAM_HOST_LAUNCH"].allSatisfy { env($0) == "1" }, "host gates on")
         require(env("MADEIRA_STEAM_HOST_APPID") == "4000" && env("MADEIRA_STEAM_HOST_CLIENT_DIR") == "C:\\Program Files (x86)\\Steam" &&
                 env("MADEIRA_STEAM_HOST_EXPECTED_INSTALL") == game.windowsInstallPath && env("MADEIRA_STEAM_HOST_LOG") == "C:\\madeira-dock.txt", "host inputs")

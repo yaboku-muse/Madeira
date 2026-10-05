@@ -2732,6 +2732,8 @@ struct ContentView: View {
                 poolSizeMB = mb
                 logStore.log("JIT pool overridden to \(mb)MB via madeira.cfg pool")
             }
+            poolSizeMB = AdaptiveJITBudget.shared.begin(defaultPool: poolSizeMB,
+                eligible: dockLaunch.dock && !dockLaunch.compact && MadeiraConfig.get("pool") == nil)
             // ml694: W^X A/B switch. Documents/madeira-wx.txt containing "0"
             // disables page demotion for the SAME binary, so the on/off
             // comparison needs one rebuild, not two. The previous gate read
@@ -2967,7 +2969,7 @@ struct ContentView: View {
                         logStore.log("madeira-d3d12: M1 canary FAILED (\(fails) checks)", level: .error)
                     }
                 } else {
-                    logStore.log("madeira-d3d12: gate off (madeira.cfg d3d12 \(raw == nil ? "unset" : "= '\(val)'"))", level: .debug)
+                    logStore.log("madeira-d3d12: shader-converter self-test disabled (madeira.cfg d3d12 \(raw == nil ? "unset" : "= '\(val)'")); this setting does not select the game's renderer", level: .debug)
                 }
             }
 
@@ -3262,6 +3264,17 @@ struct ContentView: View {
         // is handed to Valve's client, and it stays off until the Dock session has ended
         // (SteamOwnedLibrary.prepareDock / dockEnded, SteamConnectionGate).
         Task { @MainActor in
+            // Ask for the numbered launch configuration while the native Steam
+            // session is still connected; prepareDock logs that session off.
+            let launchOptions = await SteamOwnedLibrary.shared.launchOptions(appID: game.id) ?? []
+            let launchFolder = MadeiraDock.drive.appendingPathComponent(
+                game.library + "/common/" + game.installDir, isDirectory: true)
+            let launchChoice = SteamDirectStart.choose(launchOptions, installFolder: launchFolder)
+            let launchOption = launchChoice?.launchID
+            do {
+                try await SteamOwnedLibrary.shared.prepareRequiredDockContent(appID: game.id,
+                    steamApps: MadeiraDock.drive.appendingPathComponent(game.library, isDirectory: true))
+            } catch { fail(error); return }
             await SteamOwnedLibrary.shared.prepareDock()
             do {
                 // The launch state may have changed while the connection closed.
@@ -3272,9 +3285,19 @@ struct ContentView: View {
                 guard let signIn = SteamSignIn.credentialsForDock() else {
                     throw DockError.message("Sign in to Steam in Madeira before starting Dock.")
                 }
+                if let compatibility = GameCompatibilityProfile.resolve(appID: game.id,
+                    enabled: profile?.automaticCompatibility != false) {
+                    guard let user = SteamCloudPaths.userFolder(drive: MadeiraDock.drive.resolvingSymlinksInPath()) else {
+                        throw DockError.message("The Windows user folder is unavailable for renderer selection.")
+                    }
+                    let options = compatibility.settingsFile(userFolder: user.url)
+                    let changed = try compatibility.prepare(options: options)
+                    logStore.log("[compatibility-profile] app=\(game.id) revision=\(compatibility.revision) renderer=\(compatibility.preferredRenderer.rawValue) settings=\(changed ? "updated" : "unchanged-or-default")")
+                }
                 try MadeiraDock.writeHandoff(account: signIn.accountName, token: signIn.refreshToken, appID: game.id)
             } catch { fail(error); return }
-            MadeiraDock.configure(game)
+            let launchImage = launchChoice.map { game.windowsInstallPath + "\\" + $0.program.replacingOccurrences(of: "/", with: "\\") }
+            MadeiraDock.configure(game, launchOption: launchOption, expectedImage: launchImage)
             // The game's one-time installs (its Steam install script) run first, in the same
             // session. No session runs yet, so the registry files can be read and written.
             DockInstallers.prepare(game, drive: MadeiraDock.drive, prefix: MadeiraDock.prefix)
@@ -3315,6 +3338,7 @@ struct ContentView: View {
             // start this session from its own desktop size, not a previous one.
             winios_display_mode_changed(Int32(width), Int32(height))
             MadeiraDock.requestLaunch(compactPool: compactPool)
+            AdaptiveJITBudget.shared.prepare(game)
             logStore.log("[madeira-dock] starting the host for app \(game.id); Valve's client authenticates and authorizes the launch")
             MadeiraDockModel.shared.watchReport()
             if inLibrary {

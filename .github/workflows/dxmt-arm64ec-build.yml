@@ -1,0 +1,51 @@
+name: DXMT and Madeira D3D12 ARM64EC source rebuild
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dxmt-arm64ec:
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v5
+      - name: Retrieve pinned Madeira Wine and DXMT sources
+        run: git submodule update --init --recursive --depth 1 wine dxmt
+      - name: Install build tools
+        run: brew install bison meson ninja
+      - name: Fetch pinned Windows cross compiler
+        run: bash build/ci/fetch-mingw.sh
+      - name: Build DXMT ARM64EC graphics DLLs
+        run: bash build/dxmt-ios/build-pe.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DXMT-ARM64EC-source-build
+          path: build/ci-output/dxmt-arm64ec
+          retention-days: 30
+      - name: Build Madeira D3D12 DLLs and guest test executables
+        run: OUT="$PWD/build/ci-output/madeira-d3d12/modules" bash build/madeira-d3d12/build-pe.sh
+      - name: Record Madeira D3D12 output hashes and metadata
+        run: |
+          OUT=build/ci-output/madeira-d3d12
+          python3 tools/inspect-pe-imports.py "$OUT"/modules/* > "$OUT/pe-metadata.jsonl"
+          git rev-parse HEAD > "$OUT/madeira-commit.txt"
+          git submodule status --recursive wine dxmt > "$OUT/component-commits.txt"
+          (cd "$OUT/modules" && shasum -a 256 * > ../module-sha256.txt)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-D3D12-source-build
+          path: build/ci-output/madeira-d3d12
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: DXMT-ARM64EC-build-logs
+          path: |
+            wine/build-dxmt-arm64ec/config.log
+            dxmt/build-arm64ec/meson-logs/meson-log.txt
+          retention-days: 30

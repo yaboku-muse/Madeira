@@ -183,3 +183,12 @@ research/mesa-venv/
 
 # Wine Mono, fetched by build/wine-mono/fetch.sh (42 MB, verified by SHA-256)
 app/Madeira/wine-mono-*.tar.xz
+# Host Python checks and diagnostics.
+__pycache__/
+build/ci-output/
+build/ci-artifacts/
+/llvm-ios.tar.gz
+/fex-ios.tar.gz
+/native-runtime.tar.gz
+/fex-files.txt
+build/freetype-ios/build/

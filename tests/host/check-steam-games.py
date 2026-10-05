@@ -171,8 +171,9 @@ apply = library[library.index('    func applyEnvironment() {'):]
 apply = apply[:apply.index('\n    }\n')]
 require('if let cpuCount, (1..<64).contains(cpuCount) { setenv("MADEIRA_CPU_COUNT"' in apply and
         'if let anisotropyLimit, [1, 2, 4, 8].contains(anisotropyLimit) { setenv("DXMT_D9_ANISO_LIMIT"' in apply and
-        'unsetenv("MADEIRA_CPU_COUNT")' not in apply and 'unsetenv("DXMT_D9_ANISO_LIMIT")' not in apply,
-        'CPU cores and anisotropic filtering are exported only when chosen (default behaviour unchanged)')
+        'else { unsetenv("MADEIRA_CPU_COUNT") }' in apply and
+        'else { unsetenv("DXMT_D9_ANISO_LIMIT") }' in apply,
+        'CPU cores and anisotropic filtering are exported when chosen and stale choices are cleared')
 for forbidden in ['setenv(', 'unsetenv(', 'runWineFullSequence', 'writeHandoff', 'credentialsForDock', 'SteamTokenStore',
                   'refreshToken', 'SecItem', 'MADEIRA_EXE', 'MADEIRA_ARGS', 'jit_', 'JITPool', 'poolSize',
                   'steamwebhelper', 'steam.exe', 'SteamSetup', 'FEX_', 'DXMT']:
@@ -360,12 +361,14 @@ func record(_ appID: Int, _ name: String, _ folder: String, flags: Int) -> Strin
             "\"x\" { \"executable\" \"not-numbered.exe\" } \"8\" { \"arguments\" \"-no-program\" } " +
             "} } \"depots\" { \"77\" { \"manifests\" { \"public\" { \"gid\" \"1\" } } } } }"
         let directInfo = SteamAppInfo.parse(appID: 7000, from: Data(launchVDF.utf8))!
-        require(directInfo.launches.map(\.executable) == ["bin32\\game.exe", "server/srv.exe", "Direct.app", "Bin64\\\\Game.exe",
+        require(directInfo.launches.map(\.executable) == ["bin32\\game.exe", "server/srv.exe", "Direct.app", "Bin64\\Game.exe",
                                                           "beta/game.exe", "..\\escape.exe", "tools/launcher.exe", "tools/launcher.exe"],
                 "config.launch is read in Steam's numeric order, without entries that name no program: \(directInfo.launches.map(\.executable))")
         require(directInfo.launches[1].type == "server" && directInfo.launches[4].betaKey == "public-beta" &&
                 directInfo.launches[2].oslist == "macos" && directInfo.launches[3].osarch == "64",
                 "each entry keeps its type, platform, architecture and beta branch")
+        require(directInfo.launches.compactMap(\.launchID) == Array(0...7),
+                "numbered launch keys survive parsing even when entries are filtered")
         require(SteamOwnedGame(directInfo).launches == directInfo.launches, "the owned library caches the launch configuration")
         let oldCache = #"{"id":1,"name":"Old","installDir":"Old","buildID":1}"#
         require((try? JSONDecoder().decode(SteamOwnedGame.self, from: Data(oldCache.utf8)))?.launches == nil,
@@ -391,13 +394,13 @@ func record(_ appID: Int, _ name: String, _ folder: String, flags: Int) -> Strin
         try write(drive.appendingPathComponent("Program Files (x86)/Steam/steamapps/common/escape.exe"), "x")
         try fm.createSymbolicLink(at: install.appendingPathComponent("loop"), withDestinationURL: install)
         let options = directInfo.launches
-        require(D.choose(options, installFolder: install) == D.Choice(program: "bin64/game.exe", arguments: "-dx11 -skipintro", folder: nil),
+        require(D.choose(options, installFolder: install) == D.Choice(program: "bin64/game.exe", arguments: "-dx11 -skipintro", folder: nil, launchID: 3),
                 "Steam's 64-bit default entry, found without case, with its arguments: \(String(describing: D.choose(options, installFolder: install)))")
         try fm.removeItem(at: install.appendingPathComponent("bin64"))
-        require(D.choose(options, installFolder: install) == D.Choice(program: "bin32/game.exe", arguments: "", folder: nil),
+        require(D.choose(options, installFolder: install) == D.Choice(program: "bin32/game.exe", arguments: "", folder: nil, launchID: 0),
                 "its program missing: the next default entry (32-bit); never the server, macOS, beta or escaping entries")
         try fm.removeItem(at: install.appendingPathComponent("bin32"))
-        require(D.choose(options, installFolder: install) == D.Choice(program: "tools/launcher.exe", arguments: "", folder: "data"),
+        require(D.choose(options, installFolder: install) == D.Choice(program: "tools/launcher.exe", arguments: "", folder: "data", launchID: 7),
                 "then the other options in Steam's order; one whose working folder is missing is passed over")
         require(D.choose(Array(options.prefix(6)), installFolder: install) == nil, "nothing that runs here: no choice (the Program picker decides)")
         require(D.choose([SteamLaunchOption(executable: "tools/launcher.exe", workingDir: ".")], installFolder: install)?.folder == "",

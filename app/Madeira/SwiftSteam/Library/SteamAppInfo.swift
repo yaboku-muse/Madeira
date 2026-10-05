@@ -389,6 +389,8 @@ struct SteamAppInfo {
 /// Untrusted text: bounded here, and validated as a path by SteamDirectStart.
 struct SteamLaunchOption: Codable, Hashable, Sendable {
     var executable: String
+    /// The numeric key in config.launch. Older cached records omit this value.
+    var launchID: Int? = nil
     var arguments = ""
     var workingDir = ""
     /// "default", "none", "option1", "server", "editor", "vr", ... ("" when absent).
@@ -402,7 +404,8 @@ struct SteamLaunchOption: Codable, Hashable, Sendable {
     static func parse(_ launch: [String: Any]) -> [SteamLaunchOption] {
         let keys = launch.keys.compactMap { key in Int(key).map { ($0, key) } }.sorted { $0.0 < $1.0 }
         var options: [SteamLaunchOption] = []
-        for (_, key) in keys.prefix(32) {
+        for (number, key) in keys.prefix(32) {
+            guard (0...Int(Int32.max)).contains(number) else { continue }
             guard let entry = launch[key] as? [String: Any], let executable = entry["executable"] as? String,
                   !executable.isEmpty, executable.utf8.count <= 512 else { continue }
             func text(_ value: Any?, limit: Int = 256) -> String? {
@@ -414,7 +417,7 @@ struct SteamLaunchOption: Codable, Hashable, Sendable {
             guard let arguments = text(entry["arguments"], limit: 2048), let workingDir = text(entry["workingdir"], limit: 512),
                   let type = text(entry["type"]), let oslist = text(config["oslist"]), let osarch = text(config["osarch"]),
                   let betaKey = text(config["betakey"]) else { continue }
-            options.append(SteamLaunchOption(executable: executable, arguments: arguments, workingDir: workingDir,
+            options.append(SteamLaunchOption(executable: executable, launchID: number, arguments: arguments, workingDir: workingDir,
                                              type: type, oslist: oslist, osarch: osarch, betaKey: betaKey))
         }
         return options

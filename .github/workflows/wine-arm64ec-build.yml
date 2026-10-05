@@ -1,0 +1,37 @@
+name: Wine ARM64EC farm source rebuild
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wine-arm64ec:
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v5
+      - name: Retrieve pinned Madeira Wine source
+        run: git submodule update --init --depth 1 wine
+      - name: Install build tools
+        run: brew install bison
+      - name: Fetch pinned Windows cross compiler
+        run: bash build/ci/fetch-mingw.sh
+      - name: Rebuild tracked Wine-owned ARM64EC images
+        run: bash build/wine-pe/build-farm.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Wine-ARM64EC-farm-source-build
+          path: build/ci-output/wine-arm64ec
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Wine-ARM64EC-farm-build-logs
+          path: |
+            wine/build-arm64ec-farm/config.log
+            wine/build-arm64ec-farm/madeira-arm64ec-build.log
+          retention-days: 30

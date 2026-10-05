@@ -36,6 +36,75 @@ import Foundation
 let fm = FileManager.default
 let mode = CommandLine.arguments[1]
 if mode == "registry" {
+    var image = Data(repeating: 0, count: 128)
+    image[0] = 0x4d; image[1] = 0x5a; image[60] = 64
+    image[64] = 0x50; image[65] = 0x45
+    image[68] = 0x64; image[69] = 0x86
+    image[88] = 0x0b; image[89] = 0x02
+    assert(SteamRuntimeFiles.isAMD64Image(image))
+    var wrong = image; wrong[68] = 0x4c; wrong[69] = 0x01
+    assert(!SteamRuntimeFiles.isAMD64Image(wrong))
+    wrong = image; wrong[88] = 0x0b; wrong[89] = 0x01
+    assert(!SteamRuntimeFiles.isAMD64Image(wrong))
+    wrong = image; wrong[60] = 0xff; wrong[61] = 0xff
+    assert(!SteamRuntimeFiles.isAMD64Image(wrong))
+    wrong = image; wrong[0] = 0
+    assert(!SteamRuntimeFiles.isAMD64Image(wrong))
+    assert(!SteamRuntimeFiles.isAMD64Image(Data()))
+    assert(!SteamRuntimeFiles.isAMD64Image(image.prefix(90).dropFirst()))
+    print("PASS: AMD64 PE32+ runtime guard rejects x86, mixed headers, invalid offsets and truncation")
+    let update = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? fm.removeItem(at: update) }
+    let stage = update.appendingPathComponent("stage"), drive = update.appendingPathComponent("drive"), backup = update.appendingPathComponent("backup")
+    let installed = drive.appendingPathComponent(SteamRuntimeFiles.relativeRoot)
+    try fm.createDirectory(at: stage, withIntermediateDirectories: true)
+    try fm.createDirectory(at: installed, withIntermediateDirectories: true)
+    let names = ["SDL3.dll", "steamclient64.dll", "steam.exe"]
+    let old = Dictionary(uniqueKeysWithValues: names.map { ($0.lowercased(), "old:" + $0) })
+    func put(_ text: String, _ file: URL) throws { try Data(text.utf8).write(to: file) }
+    func read(_ file: URL) -> String { try! String(contentsOf: file, encoding: .utf8) }
+    let hash: (Data) -> String = { String(decoding: $0, as: UTF8.self) }
+    for name in names { try put("new:" + name, stage.appendingPathComponent(name)); try put("old:" + name, installed.appendingPathComponent(name)) }
+    let saves = installed.appendingPathComponent("steamapps/common/Fixture")
+    try fm.createDirectory(at: saves, withIntermediateDirectories: true)
+    try put("save kept", saves.appendingPathComponent("save.bin"))
+    try put("account kept", installed.appendingPathComponent("loginusers.vdf"))
+    var commits = 0
+    try put("unknown", installed.appendingPathComponent("steam.exe"))
+    do {
+        try SteamRuntimeFiles.publish(stage: stage, drive: drive, backupRoot: backup, names: names, legacy: old, hash: hash, checkQuiescent: {}, beforeCommit: { commits += 1 })
+        fatalError("unknown file replaced")
+    } catch SteamRuntimeFiles.Failure.conflict { }
+    assert(commits == 0 && !fm.fileExists(atPath: backup.path))
+    assert(read(installed.appendingPathComponent("SDL3.dll")) == "old:SDL3.dll")
+    try put("old:steam.exe", installed.appendingPathComponent("steam.exe"))
+    enum Interrupted: Error { case stop }
+    var guards = 0
+    do {
+        try SteamRuntimeFiles.publish(stage: stage, drive: drive, backupRoot: backup, names: names, legacy: old, hash: hash,
+            checkQuiescent: { guards += 1; if guards == 4 { throw Interrupted.stop } }, beforeCommit: {
+                commits += 1
+                for name in names { assert(read(backup.appendingPathComponent(name)) == "old:" + name) }
+            })
+        fatalError("interruption ignored")
+    } catch Interrupted.stop { }
+    assert(read(installed.appendingPathComponent("SDL3.dll")) == "new:SDL3.dll")
+    assert(read(installed.appendingPathComponent("steam.exe")) == "old:steam.exe")
+    try SteamRuntimeFiles.publish(stage: stage, drive: drive, backupRoot: backup, names: names, legacy: old, hash: hash, checkQuiescent: {}, beforeCommit: { commits += 1 })
+    for name in names {
+        assert(read(installed.appendingPathComponent(name)) == "new:" + name)
+        assert(read(backup.appendingPathComponent(name)) == "old:" + name)
+    }
+    try SteamRuntimeFiles.publish(stage: stage, drive: drive, backupRoot: backup, names: names, legacy: old, hash: hash, checkQuiescent: {}, beforeCommit: {})
+    assert(read(saves.appendingPathComponent("save.bin")) == "save kept")
+    assert(read(installed.appendingPathComponent("loginusers.vdf")) == "account kept")
+    try put("old:SDL3.dll", installed.appendingPathComponent("SDL3.dll"))
+    do {
+        try SteamRuntimeFiles.publish(stage: stage, drive: drive, backupRoot: backup, names: names, legacy: old, hash: hash, checkQuiescent: {}, beforeCommit: { try put("concurrent edit", installed.appendingPathComponent("SDL3.dll")) })
+        fatalError("concurrent edit replaced")
+    } catch SteamRuntimeFiles.Failure.conflict { }
+    assert(read(installed.appendingPathComponent("SDL3.dll")) == "concurrent edit")
+    print("PASS: complete preflight, verified backups, interrupted upgrade/retry, idempotence, unrelated files and concurrent-edit refusal")
     let original = "WINE REGISTRY Version 2\n\n[Software\\\\Keep]\n\"Unrelated\"=\"preserved\"\n"
     for machine in [false, true] {
         let result = try SteamRuntimeFiles.registry(original, machine: machine)
@@ -69,6 +138,9 @@ if mode == "registry" {
         var files: [String: Data] = [:]
         try SteamRuntimeFiles.unpack(data) { files[$0] = $1 }
         if mode == "reject" { fatalError("malformed archive accepted") }
+        for (name, data) in files where SteamRuntimeFiles.criticalFileSHA256[name] != nil {
+            assert(SteamRuntimeFiles.isAMD64Image(data))
+        }
         let output = URL(fileURLWithPath: CommandLine.arguments[3])
         for (name, data) in files {
             let url = output.appendingPathComponent(name)

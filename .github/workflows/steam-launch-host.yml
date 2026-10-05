@@ -1,0 +1,43 @@
+name: Steam launch host checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  mach-stp:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native ARM paired-store alias regression
+        run: python3 tests/host/check-mach-stp-alias.py
+      - name: Native content control measurement
+        run: python3 tests/host/check-depot-native-control.py
+  steam-launch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tool versions
+        run: |
+          python3 --version
+          swiftc --version
+      - name: Steam launch configuration and routing
+        run: python3 tests/host/check-steam-games.py
+      - name: Automatic renderer settings and preservation
+        run: python3 tests/host/check-game-compatibility.py
+      - name: Fixed executable cleanup ownership
+        run: python3 tests/host/check-fixed-image-owner-ready.py
+      - name: Child socket generation ownership
+        run: python3 tests/host/check-process-socket-ownership.py
+      - name: Successful process creation records
+        run: python3 tests/host/check-process-created-record.py
+      - name: Launch lifetime and display state
+        run: python3 tests/host/check-dock-start-screen.py
+      - name: Mach writable alias atomic operations
+        run: python3 tests/host/check-mach-lse-alias.py
+      - name: Parse downloader source
+        run: swiftc -frontend -parse app/Madeira/SwiftSteam/Content/DepotDownloader.swift

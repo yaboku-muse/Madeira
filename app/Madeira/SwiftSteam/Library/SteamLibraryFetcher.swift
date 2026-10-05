@@ -146,6 +146,50 @@ class SteamLibraryFetcher {
         return app
     }
 
+    /// Required shared installers live in their owner's common directory, not
+    /// the game folder. Resolve only the consumer's exact declared depots.
+    /// This is metadata; depot keys and content authorization remain mandatory.
+    func fetchRequiredSharedInstalls(appID: UInt32) async throws -> [SteamAppInfo] {
+        guard let app = try await fetchAppInfo(appID: appID) else {
+            throw SteamError.appInfoNotFound(appID)
+        }
+        let required = app.depots.filter {
+            $0.isSharedInstall && $0.dlcAppID == nil && $0.supports(os: "windows") &&
+            !$0.lowViolence && ($0.language.isEmpty || $0.language.lowercased() == "english")
+        }
+        guard required.count <= 256 else { throw SteamFileError.invalid("Too many required installer depots.") }
+        let groups = Dictionary(grouping: required, by: { $0.fromApp ?? appID })
+        guard groups.count <= 32 else { throw SteamFileError.invalid("Too many required installer apps.") }
+        var result: [SteamAppInfo] = []
+        for ownerID in groups.keys.sorted() {
+            try Task.checkCancellation()
+            let metadata: SteamAppInfo?
+            if ownerID == appID { metadata = app }
+            else { metadata = try await fetchAppInfo(appID: ownerID) }
+            guard var owner = metadata,
+                  !owner.installDir.isEmpty else {
+                throw SteamFileError.invalid("Steam did not provide required installer metadata.")
+            }
+            var selected: [SteamAppInfo.DepotInfo] = []
+            for requiredDepot in groups[ownerID]! {
+                guard var depot = owner.depots.first(where: { $0.depotID == requiredDepot.depotID }),
+                      depot.publicManifestID != nil, depot.supports(os: "windows"),
+                      depot.fromApp == nil || depot.fromApp == ownerID else {
+                    throw SteamFileError.invalid("Steam did not provide a required installer manifest.")
+                }
+                // These are now installed as their owner, in its own directory.
+                depot.isSharedInstall = false
+                depot.fromApp = nil
+                selected.append(depot)
+            }
+            owner.depots = selected
+            owner.sharedOwners = [:]
+            result.append(owner)
+        }
+        SteamLog.event("[steam-required-content] app=\(appID) owners=\(result.count) depots=\(required.count)")
+        return result
+    }
+
     // MARK: - License List
 
     private func fetchLicenseList() async throws -> [UInt32] {

@@ -1,0 +1,35 @@
+name: Wine WOW64 host source rebuild
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wine-wow64:
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v5
+      - name: Retrieve pinned Madeira Wine source
+        run: git submodule update --init --depth 1 wine
+      - name: Install build tools
+        run: brew install bison
+      - name: Fetch pinned Windows cross compiler
+        run: bash build/ci/fetch-mingw.sh
+      - name: Rebuild ARM64 ntdll and WOW64 host DLLs
+        run: bash build/wine-pe/build-wow64.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Wine-WOW64-host-source-build
+          path: build/ci-output/wine-wow64
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: Wine-WOW64-build-errors
+          path: wine/build-wow64-pe/config.log
+          retention-days: 30

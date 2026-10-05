@@ -19,6 +19,169 @@ enum DockPerformancePolicy {
     }
 }
 
+/// Learned pool policy. Observations include the entire Dock session's image
+/// head and translated-code tail, with a 25% + 128 MB growth allowance.
+struct AdaptiveJITRecord: Codable, Equatable {
+    var peakMB = 0
+    var observations = 0
+    var blocked = false
+
+    func poolMB(standard: Int) -> Int {
+        guard !blocked, observations >= 2, peakMB > 0, peakMB <= 1152,
+              standard >= 512, standard <= 1152 else { return standard }
+        let margin = peakMB + (peakMB + 3) / 4 + 128
+        return min(standard, max(512, ((margin + 63) / 64) * 64))
+    }
+
+    mutating func observe(peak: Int, capacity: Int, seconds: Double, frames: UInt64) {
+        guard seconds.isFinite, seconds >= 180, frames >= 300, peak > 0,
+              capacity >= 256, capacity <= 1152, peak <= capacity else { return }
+        peakMB = max(peakMB, peak)
+        if peak + 64 >= capacity {
+            // Close to exhaustion is evidence against shrinking, even if the
+            // Steam launch completed. A newer game build starts a fresh record.
+            blocked = true
+            observations = 0
+        } else {
+            observations = min(2, max(0, observations) + 1)
+        }
+    }
+
+    mutating func interrupted(chosen: Int, standard: Int) {
+        observations = 0
+        if chosen < standard { blocked = true }
+    }
+}
+
+#if os(iOS)
+/// Private numeric app/build records. Atomic file writes make the in-progress
+/// marker visible before requesting a smaller pool from StikDebug.
+final class AdaptiveJITBudget: @unchecked Sendable {
+    static let shared = AdaptiveJITBudget()
+    private struct Pending: Codable { let key: String; let chosen: Int; let standard: Int }
+    private struct Disk: Codable {
+        var records: [String: AdaptiveJITRecord] = [:]
+        var pending: Pending?
+    }
+    private struct Session {
+        let key: String, chosen: Int, standard: Int
+        let presents: UInt64
+        var peakMB = 0
+        var capacityMB = 0
+        var firstPresentAt: Double?
+    }
+    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "madeira.jit-budget")
+    private var disk = Disk()
+    private var preparedKey: String?
+    private var session: Session?
+    private var timer: DispatchSourceTimer?
+    private let file: URL?
+
+    private init() {
+        file = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("MadeiraMemory", isDirectory: true).appendingPathComponent("jit-v1.json")
+        if let file, let handle = try? FileHandle(forReadingFrom: file) {
+            defer { try? handle.close() }
+            if let data = try? handle.read(upToCount: 65537), data.count <= 65536,
+               let saved = try? JSONDecoder().decode(Disk.self, from: data), saved.records.count <= 128 {
+                disk = saved
+            }
+        }
+        if let pending = disk.pending {
+            var record = disk.records[pending.key] ?? AdaptiveJITRecord()
+            record.interrupted(chosen: pending.chosen, standard: pending.standard)
+            disk.records[pending.key] = record
+            disk.pending = nil
+        }
+    }
+
+    private func persist() throws {
+        guard let file else { throw CocoaError(.fileNoSuchFile) }
+        let directory = file.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700, .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication])
+        var excluded = URLResourceValues(); excluded.isExcludedFromBackup = true
+        var folder = directory; try folder.setResourceValues(excluded)
+        try JSONEncoder().encode(disk).write(to: file, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    }
+
+    func prepare(_ game: DockGame) {
+        var key: String?
+        let url = MadeiraDock.drive.appendingPathComponent(game.library + "/appmanifest_\(game.id).acf")
+        if let handle = try? FileHandle(forReadingFrom: url) {
+            defer { try? handle.close() }
+            if let data = try? handle.read(upToCount: 1048577), data.count <= 1048576,
+               var parser = try? SteamKeyValues(data), let root = try? parser.read(),
+               root["AppState"]?["appid"]?.string == String(game.id),
+               let text = root["AppState"]?["buildid"]?.string, let build = UInt32(text), build > 0 {
+                key = "\(game.id)-\(build)-v1"
+            }
+        }
+        lock.lock(); preparedKey = key; lock.unlock()
+    }
+
+    func begin(defaultPool: Int, eligible: Bool) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let key = preparedKey; preparedKey = nil
+        guard eligible, let key, session == nil else { return defaultPool }
+        let chosen = (disk.records[key] ?? AdaptiveJITRecord()).poolMB(standard: defaultPool)
+        while disk.records.count >= 128 && disk.records[key] == nil {
+            guard let first = disk.records.keys.sorted().first else { break }
+            disk.records.removeValue(forKey: first)
+        }
+        disk.records[key] = disk.records[key] ?? AdaptiveJITRecord()
+        disk.pending = Pending(key: key, chosen: chosen, standard: defaultPool)
+        do { try persist() } catch {
+            disk.pending = nil
+            SteamLog.event("[jit-budget] cache-write-failed; standard pool retained")
+            return defaultPool
+        }
+        session = Session(key: key, chosen: chosen, standard: defaultPool, presents: madeira_get_present_count())
+        let source = DispatchSource.makeTimerSource(queue: queue)
+        source.schedule(deadline: .now() + 1, repeating: 1)
+        source.setEventHandler { [weak self] in self?.sample() }
+        timer = source; source.resume()
+        SteamLog.event("[jit-budget] poolMB=\(chosen) standardMB=\(defaultPool) learned=\(chosen < defaultPool ? 1 : 0)")
+        return chosen
+    }
+
+    private func sample() {
+        var used: UInt64 = 0, capacity: UInt64 = 0
+        ios_jit_pool_usage(&used, &capacity)
+        guard capacity >= 256 * 1048576, capacity <= 1152 * 1048576, used <= capacity else { return }
+        lock.lock(); defer { lock.unlock() }
+        guard var active = session else { return }
+        active.peakMB = max(active.peakMB, Int((used + 1048575) / 1048576))
+        active.capacityMB = Int(capacity / 1048576)
+        if active.firstPresentAt == nil && madeira_get_present_count() > active.presents {
+            active.firstPresentAt = ProcessInfo.processInfo.systemUptime
+        }
+        session = active
+    }
+
+    func finish(completed: Bool) {
+        sample()
+        lock.lock(); defer { lock.unlock() }
+        guard let active = session else { return }
+        timer?.cancel(); timer = nil; session = nil
+        var record = disk.records[active.key] ?? AdaptiveJITRecord()
+        if completed {
+            let present = madeira_get_present_count()
+            record.observe(peak: active.peakMB, capacity: active.capacityMB,
+                seconds: active.firstPresentAt.map { ProcessInfo.processInfo.systemUptime - $0 } ?? 0,
+                frames: present >= active.presents ? present - active.presents : 0)
+        } else {
+            record.interrupted(chosen: active.chosen, standard: active.standard)
+        }
+        disk.records[active.key] = record; disk.pending = nil
+        do { try persist() } catch { SteamLog.event("[jit-budget] final cache write failed") }
+        SteamLog.event("[jit-budget] observedPeakMB=\(active.peakMB) capacityMB=\(active.capacityMB) samples=\(record.observations) blocked=\(record.blocked ? 1 : 0)")
+    }
+}
+#endif
+
 enum DockError: LocalizedError {
     case message(String)
     var errorDescription: String? { if case .message(let text) = self { return text }; return nil }
@@ -53,6 +216,8 @@ struct DockGame: Identifiable, Equatable, Sendable {
 /// The app side is this contract: environment variables, a one-use sign-in
 /// transfer file and a numeric report file (C:\madeira-dock.txt).
 enum MadeiraDock {
+    /// Validated selected launch image. Configured and read on the main thread.
+    nonisolated(unsafe) static private(set) var launchImage: String?
     /// `env.MADEIRA_DOCK = 0` hides Dock. Without a built dockhost.exe it is hidden too.
     static var enabled: Bool { SteamSignIn.flag("MADEIRA_DOCK", default: true) && bundled }
     static var bundled: Bool {
@@ -231,6 +396,7 @@ enum MadeiraDock {
                 default: return "Steam could not prepare this game's executable for your account (code \(fields["ceg-result"] ?? "?"))."
                 }
             }
+            if result == 50 { return "Madeira Dock received an invalid Steam launch option. Refresh this game's Steam configuration and try again." }
             if result == 45 || result == 48, let error = fields["launch-client-error"].flatMap(Int.init),
                (22...23).contains(error), fields["launch-config-wait"] != nil {
                 return "Steam did not finish loading this game's configuration after signing in. Wait a minute and start the game again."
@@ -283,7 +449,8 @@ enum MadeiraDock {
         "session-online-subscription-count", "session-online-app-zero-query", "session-online-callback-id",
         "session-timeout-subscription-count", "session-timeout-app-listed", "session-timeout-still-online",
         "session-online-blip", "session-online-blips", "session-online-lost", "session-entitlement-source",
-        "launch-client-error", "launch-update-wait", "launch-update-retry", "launch-update-ready",
+        "launch-client-error", "launch-option", "launch-option-invalid", "launch-update-wait", "launch-update-retry", "launch-update-ready",
+        "launch-request-submitted", "launch-game-running", "launch-game-ended",
         "launch-config-wait", "launch-config-gave-up", "launch-session-wait", "launch-session-gave-up",
         "ceg-request", "ceg-request-result", "ceg-request-busy", "ceg-server-result", "ceg-job-result",
         "ceg-finished-jobs", "ceg-result", "ceg-disabled", "ceg-unsupported-client",
@@ -336,6 +503,10 @@ enum MadeiraDock {
         // its numeric fields are in the diagnostic log (each line is `[steam-host]
         // <round> <field>=<number>`; nothing else is in the file).
         if report.fields["probe-result"] != nil, lastReport.fields["probe-result"] == nil {
+            #if os(iOS)
+            AdaptiveJITBudget.shared.finish(completed: report.result == 0 &&
+                report.fields["launch-game-ended"] == "1" && report.fields["launch-game-running"] == "1")
+            #endif
             let lines = String(decoding: data, as: UTF8.self).split(separator: "\n").filter { $0.hasPrefix("[steam-host] ") }
             SteamLog.event("[dock-report-file] lines=\(lines.count)")
             for line in lines.prefix(400) { SteamLog.event("[dock-report-file] " + line.trimmingCharacters(in: .whitespacesAndNewlines)) }
@@ -390,11 +561,17 @@ enum MadeiraDock {
     }
 
     /// The host's environment for one launch.
-    static func configure(_ game: DockGame) {
+    static func configure(_ game: DockGame, launchOption: Int? = nil, expectedImage: String? = nil) {
+        launchImage = expectedImage
         for key in ["MADEIRA_STEAM_HOST_PROBE", "MADEIRA_STEAM_HOST_SESSION", "MADEIRA_STEAM_HOST_LOGIN", "MADEIRA_STEAM_HOST_LAUNCH"] {
             setenv(key, "1", 1)
         }
         setenv("MADEIRA_STEAM_HOST_APPID", String(game.id), 1)
+        if let launchOption, launchOption >= 0 && launchOption <= Int(Int32.max) {
+            setenv("MADEIRA_STEAM_HOST_LAUNCH_OPTION", String(launchOption), 1)
+        } else {
+            unsetenv("MADEIRA_STEAM_HOST_LAUNCH_OPTION")
+        }
         setenv("MADEIRA_STEAM_HOST_CLIENT_DIR", SteamRuntimeFiles.windowsRoot, 1)
         setenv("MADEIRA_STEAM_HOST_EXPECTED_INSTALL", game.windowsInstallPath, 1)
         setenv("MADEIRA_STEAM_HOST_LOG", "C:\\madeira-dock.txt", 1)

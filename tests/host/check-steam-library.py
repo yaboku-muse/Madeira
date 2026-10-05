@@ -150,6 +150,9 @@ require(len(permitted) == 1 and re.findall(r'<string>([^<]*)</string>', permitte
         "Info.plist permits only the bundle's own .download.* (background downloads) tasks")
 require('UIBackgroundModes' not in info, 'Info.plist asks for no background mode')
 background = sources['SteamDownloadBackground.swift']
+background_entry = background.split('UIApplication.didEnterBackgroundNotification', 1)[1].split('UIApplication.didBecomeActiveNotification', 1)[0]
+require('cancelNativeControl()' in background_entry and background_entry.index('cancelNativeControl()') < background_entry.index('beginGrace()'),
+        'native control cancellation is unconditional on background entry, before download-only grace handling')
 require('hasSuffix(".download.*")' in background and '+ "queue"' in background and 'BGContinuedProcessingTaskRequest(identifier: identifier' in background,
         'the continued-processing task uses the permitted identifier, made concrete')
 require('SteamSignIn.flag("MADEIRA_BACKGROUND_DOWNLOADS", default: true)' in background and
@@ -179,6 +182,9 @@ watch = block(dock_view, 'func watchReport()')
 require(watch.index('MadeiraDock.cleanup()') < watch.index('SteamOwnedLibrary.shared.dockEnded()'),
         "the connection may come back only when the Dock host's report or session is over")
 owned_model = sources['SteamOwnedLibrary.swift']
+required = block(owned_model, 'func prepareRequiredDockContent(appID: Int, steamApps: URL) async throws')
+require(required.index('await running?.value') < required.index('SteamRuntimeInstaller.shared.prepareIfNeeded') < required.index('fetcher.fetchRequiredSharedInstalls'),
+        'the runtime upgrade runs after downloads pause and before shared-content preparation and Dock handoff')
 prepare = block(owned_model, 'func prepareDock() async')
 require(prepare.index('sessionChanged(active: true)') < prepare.index('await running?.value') < prepare.index('await gate.holdForDock()'),
         'prepareDock pauses downloads, waits for the running one, then waits for the connection to close')
@@ -824,7 +830,8 @@ func packageBuffer(apps: [UInt32], depots: [UInt32]) -> Data {
     let vectors = fx["vectors"] as! [String: String]
     for kind in ["zstd", "lzma", "zip"] {
         let encrypted = hexData(vectors[kind]!)
-        let out = try ContentDecryptor.processChunk(encryptedData: encrypted, depotKey: key, expectedCRC: ContentDecryptor.adler32(plainVector), expectedSize: plainVector.count)
+        var timing = ContentDecryptor.ProcessingTiming()
+        let out = try ContentDecryptor.processChunk(encryptedData: encrypted, depotKey: key, expectedCRC: ContentDecryptor.adler32(plainVector), expectedSize: plainVector.count, timing: &timing)
         require(out == plainVector, "the \(kind) container decodes to the original bytes")
         do { _ = try ContentDecryptor.processChunk(encryptedData: encrypted, depotKey: key, expectedCRC: ContentDecryptor.adler32(plainVector) ^ 1, expectedSize: plainVector.count); require(false, "\(kind): a wrong checksum is rejected") }
         catch { require(error as? SteamError == .checksumMismatch, "\(kind): a wrong checksum is rejected") }
@@ -926,6 +933,25 @@ func packageBuffer(apps: [UInt32], depots: [UInt32]) -> Data {
             "\"branches\" { \"public\" { \"buildid\" \"7\" } } } }"]
     let fetcher = SteamLibraryFetcher(session: session)
     guard let app = try await fetcher.fetchInstallInfo(appID: 9000) else { require(false, "app info"); return }
+    session.appInfo[9300] = "\"appinfo\" { \"common\" { \"name\" \"Consumer\" \"type\" \"Game\" } \"config\" { \"installdir\" \"Consumer\" } \"depots\" { \"9003\" { \"sharedinstall\" \"1\" \"depotfromapp\" \"9200\" \"config\" { \"oslist\" \"windows\" } } } }"
+    session.appInfo[9200] = "\"appinfo\" { \"common\" { \"name\" \"Installer Owner\" \"type\" \"Tool\" } \"config\" { \"installdir\" \"Installer Store\" } \"depots\" { \"9003\" { \"manifests\" { \"public\" { \"gid\" \"\(gidShared)\" } } } \"9999\" { \"manifests\" { \"public\" { \"gid\" \"999\" } } } \"branches\" { \"public\" { \"buildid\" \"7\" } } } }"
+    let installers = try await fetcher.fetchRequiredSharedInstalls(appID: 9300)
+    require(installers.count == 1 && installers[0].appID == 9200 && installers[0].installDir == "Installer Store",
+            "required installers resolve into the owner directory")
+    require(installers[0].installDepots().map(\.depotID) == [9003], "only declared installer depots are selected")
+    let noInstallers = try await fetcher.fetchRequiredSharedInstalls(appID: 9000)
+    require(noInstallers.isEmpty, "games without shared installers have no extra content")
+    let goodOwner = session.appInfo[9200]
+    session.appInfo[9200] = "\"appinfo\" { \"common\" { \"name\" \"Installer Owner\" \"type\" \"Tool\" } \"config\" { \"installdir\" \"Installer Store\" } \"depots\" { \"9003\" { } } }"
+    do {
+        _ = try await fetcher.fetchRequiredSharedInstalls(appID: 9300)
+        require(false, "missing required installer manifest must fail")
+    } catch {
+        if case SteamFileError.invalid(let reason) = error {
+            require(reason.contains("manifest"), "missing required installer manifest fails before recording readiness")
+        } else { require(false, "unexpected installer metadata failure") }
+    }
+    session.appInfo[9200] = goodOwner
     require(app.depots.first { $0.depotID == 9003 }?.publicManifestID == UInt64(gidShared), "the shared depot got its manifest from the owning app")
     require(app.sharedOwners[9100]?.installDir == "Fixture Game", "the owner of the shared depot is known for the record")
     let downloader = DepotDownloader(session: session)
@@ -959,8 +985,57 @@ func packageBuffer(apps: [UInt32], depots: [UInt32]) -> Data {
         require(SteamInstallFiles.buildID(appID: 9000, steamApps: steamApps) == build, "the record's build id")
         require(found.first(where: { $0.id == 9100 })?.installed == true, "the owning app has its own record for the shared depot, as Valve's client requires")
         let events = loggedEvents.joined(separator: "\n")
+        require(events.contains("[steam-install] timing app=9000 completed=1"), "the full install interval includes finalization")
+        require(events.contains("process-cpu-seconds=") && events.contains("process-cpu-cores="), "actual process CPU counters are reported")
+        if phase == "update" {
+            let measurements = loggedEvents.filter { $0.hasPrefix("[steam-depot] timing ") }
+            func sum(_ key: String) -> Double {
+                measurements.reduce(0) { total, line in
+                    let value = line.split(separator: " ").first { $0.hasPrefix(key + "=") }
+                    return total + (value.flatMap { Double($0.dropFirst(key.count + 1)) } ?? 0)
+                }
+            }
+            require(sum("resume-checks") > 0 && sum("resume-hits") > 0 && sum("resume-checked-bytes") > 0,
+                    "the unchanged update chunks are checked and reused with measured byte counts")
+            require(events.contains("resume-check-sum=") && events.contains("resume-sha1-sum="), "on-disk read/check and SHA-1 durations are separated")
+        }
         require(!events.contains("Fixture") && !events.contains("7656119") && !events.contains("tok"), "no name, account or token in the log")
         require(events.contains("[steam-depot] license app=9000 skipped=9004"), "a depot the account neither has a key for nor a license for is left out")
+        _ = try await downloader.install(installers[0], steamApps: steamApps, mergeExistingOwnerRecord: true) { _ in }
+        require(SteamInstallFiles.buildID(appID: 9200, steamApps: steamApps) == 7,
+                "verified shared installer content writes its owner record")
+        require(FileManager.default.fileExists(atPath: steamApps.appendingPathComponent("common/Installer Store").path),
+                "shared installer files are installed outside the game directory")
+        if phase == "resume" {
+            // Reuse the installed downloader, whose depotCache is now populated.
+            // Its custom-executable manifest must not be republished by a control.
+            let cache = steamApps.appendingPathComponent("depotcache/9001_\(gid).manifest")
+            let cached = try Data(contentsOf: cache)
+            try FileManager.default.removeItem(at: cache)
+            let recordURL = steamApps.appendingPathComponent("appmanifest_9000.acf")
+            let record = try Data(contentsOf: recordURL)
+            var sample = app
+            sample.depots = app.depots.filter { $0.depotID == 9001 }
+            downloader.contentHosts = { _ in [hosts.last!] }
+            do {
+                _ = try await downloader.nativeControl(sample)
+                require(false, "the tiny fixture cannot masquerade as a valid control sample")
+            } catch SteamError.chunkDownloadFailed(let message) {
+                require(message.contains("16 MiB"), "the authorized manifest is parsed before sample refusal")
+            }
+            require(!FileManager.default.fileExists(atPath: cache.path), "native control never republishes the cached custom-executable manifest")
+            let afterControl = try Data(contentsOf: recordURL)
+            require(afterControl == record, "native control does not change the install record")
+            try cached.write(to: cache)
+            sample.depots = app.depots.filter { $0.depotID == 9004 }
+            do {
+                _ = try await downloader.nativeControl(sample)
+                require(false, "native control must honor a refused depot key")
+            } catch SteamError.depotKeyNotFound(let depot) {
+                require(depot == 9004, "refused owned-content authorization cannot become a control transfer")
+            }
+            print("PASS: owned native control preserves the populated manifest cache and install record and honors depot-key refusal")
+        }
     }
     if phase == "update" {
         require(SteamInstallFiles.buildID(appID: 9000, steamApps: steamApps) == 1001, "the update changed the recorded build")
@@ -970,7 +1045,10 @@ func packageBuffer(apps: [UInt32], depots: [UInt32]) -> Data {
     }
     if phase == "uninstall" {
         SteamInstallFiles.delete(appID: 9000, folderName: "Fixture Game", steamApps: steamApps)
-        require(MadeiraDock.games(drive: drive).isEmpty, "an uninstalled game is no longer found (its shared owner record went with it)")
+        let remaining = MadeiraDock.games(drive: drive)
+        require(!remaining.contains { $0.id == 9000 || $0.id == 9100 }, "an uninstalled game and its same-folder shared owner are no longer found")
+        require(remaining.contains { $0.id == 9200 } && FileManager.default.fileExists(atPath: steamApps.appendingPathComponent("common/Installer Store").path),
+                "uninstalling the game preserves separately installed shared runtime content")
         require(!FileManager.default.fileExists(atPath: steamApps.appendingPathComponent("common/Fixture Game").path), "its folder is gone")
         require(FileManager.default.fileExists(atPath: steamApps.appendingPathComponent("common").path) , "the common folder stays")
     }

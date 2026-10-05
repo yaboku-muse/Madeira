@@ -380,6 +380,22 @@ int winios_drv_census_owner( HWND hwnd, unsigned int *pid, unsigned int *style )
     return 1;
 }
 
+/* Swapchain creation can precede WindowPosChanged. Snapshot geometry on the
+ * calling Wine thread so the launch census can list that render window too. */
+int winios_drv_census_rect( HWND hwnd, int *x, int *y, int *w, int *h, int *visible )
+{
+    struct window_rects rects;
+    unsigned int pid, style;
+    if (!winios_drv_census_owner( hwnd, &pid, &style ) ||
+        !get_window_rects( hwnd, COORDS_SCREEN, &rects, get_thread_dpi() )) return 0;
+    *x = rects.client.left;
+    *y = rects.client.top;
+    *w = rects.client.right - rects.client.left;
+    *h = rects.client.bottom - rects.client.top;
+    *visible = !!(style & WS_VISIBLE);
+    return 1;
+}
+
 /* The executable path of process `pid`, as the server recorded it when the
  * process started (no handle is opened): lower-case, with the NT "\??\"
  * prefix removed, so "\??\C:\Windows\explorer.exe" reads
@@ -426,6 +442,114 @@ int winios_drv_foreground_if_owner( HWND hwnd )
 {
     if (!hwnd || get_window_thread( hwnd, NULL ) != GetCurrentThreadId()) return 0;
     return NtUserSetForegroundWindow( hwnd ) ? 1 : -1;
+}
+
+/* Startup repair is limited to the first unowned game-mode render HWND per
+ * process. Keep the record after consumption: recreating a swapchain must not
+ * undo a later intentional minimize. Never call window APIs with this lock. */
+#define WINIOS_RENDER_START_MAX 32
+static pthread_mutex_t winios_render_start_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct winios_render_start {
+    HWND hwnd;
+    DWORD pid, tid, due;
+    int pending;
+} winios_render_starts[WINIOS_RENDER_START_MAX];
+
+static int winios_render_window_eligible( HWND hwnd, DWORD *pid, DWORD *tid )
+{
+    DWORD style = get_window_long( hwnd, GWL_STYLE );
+    DWORD exstyle = get_window_long( hwnd, GWL_EXSTYLE );
+    *tid = get_window_thread( hwnd, pid );
+    return *tid && !(style & (WS_CHILD | WS_DISABLED)) && (style & WS_VISIBLE) &&
+           !(exstyle & (WS_EX_TOOLWINDOW | WS_EX_DLGMODALFRAME)) &&
+           NtUserGetAncestor( hwnd, GA_PARENT ) && !get_window_relative( hwnd, GW_OWNER );
+}
+
+static int winios_render_geometry_invalid( const struct window_rects *rects, RECT screen, DWORD style )
+{
+    /* Widen before subtraction: malformed guest geometry must not overflow. */
+    long long width = (long long)screen.right - screen.left;
+    long long height = (long long)screen.bottom - screen.top;
+    long long margin = width > height ? width : height;
+    if (width <= 0 || height <= 0 || width > 0x7fffffff || height > 0x7fffffff) return 0;
+    if (style & WS_MINIMIZE) return 1;
+    if (rects->client.right <= rects->client.left || rects->client.bottom <= rects->client.top) return 1;
+    return (long long)rects->window.right < (long long)screen.left - margin ||
+           (long long)rects->window.left > (long long)screen.right + margin ||
+           (long long)rects->window.bottom < (long long)screen.top - margin ||
+           (long long)rects->window.top > (long long)screen.bottom + margin;
+}
+
+void winios_drv_render_window_created( HWND hwnd )
+{
+    DWORD pid = 0, tid = 0;
+    struct window_rects rects;
+    RECT screen = get_virtual_screen_rect( 0, MDT_DEFAULT );
+    int slot = -1, pending;
+    if (!hwnd || !winios_render_window_eligible( hwnd, &pid, &tid ) ||
+        !get_window_rects( hwnd, COORDS_SCREEN, &rects, get_thread_dpi() )) return;
+    pending = winios_render_geometry_invalid( &rects, screen, get_window_long( hwnd, GWL_STYLE ) );
+    pthread_mutex_lock( &winios_render_start_lock );
+    for (int i = 0; i < WINIOS_RENDER_START_MAX; i++)
+    {
+        if (winios_render_starts[i].hwnd && winios_render_starts[i].pid == pid) {
+            pthread_mutex_unlock( &winios_render_start_lock );
+            return;
+        }
+        if (!winios_render_starts[i].hwnd && slot < 0) slot = i;
+    }
+    if (slot >= 0) winios_render_starts[slot] = (struct winios_render_start){hwnd, pid, tid, NtGetTickCount() + 500, pending};
+    pthread_mutex_unlock( &winios_render_start_lock );
+}
+
+void winios_drv_render_window_forget( HWND hwnd )
+{
+    pthread_mutex_lock( &winios_render_start_lock );
+    for (int i = 0; i < WINIOS_RENDER_START_MAX; i++)
+        if (!hwnd || winios_render_starts[i].hwnd == hwnd)
+            memset( &winios_render_starts[i], 0, sizeof(winios_render_starts[i]) );
+    pthread_mutex_unlock( &winios_render_start_lock );
+}
+
+/* The HWND owner's event pump performs one revalidated repair after a grace
+ * interval. This is outside WindowPosChanged and outside the registry lock. */
+void winios_drv_repair_render_windows(void)
+{
+    struct winios_render_start work[WINIOS_RENDER_START_MAX];
+    DWORD tid = GetCurrentThreadId(), now = NtGetTickCount();
+    int count = 0;
+    pthread_mutex_lock( &winios_render_start_lock );
+    for (int i = 0; i < WINIOS_RENDER_START_MAX; i++)
+        if (winios_render_starts[i].pending && winios_render_starts[i].tid == tid &&
+            (INT)(now - winios_render_starts[i].due) >= 0)
+        {
+            work[count++] = winios_render_starts[i];
+            winios_render_starts[i].pending = 0;
+        }
+    pthread_mutex_unlock( &winios_render_start_lock );
+    for (int i = 0; i < count; i++)
+    {
+        DWORD pid = 0, owner = 0, style;
+        struct window_rects rects;
+        RECT screen = get_virtual_screen_rect( 0, MDT_DEFAULT );
+        HWND hwnd = work[i].hwnd;
+        if (!winios_render_window_eligible( hwnd, &pid, &owner ) || pid != work[i].pid || owner != tid ||
+            !get_window_rects( hwnd, COORDS_SCREEN, &rects, get_thread_dpi() )) continue;
+        style = get_window_long( hwnd, GWL_STYLE );
+        if (!winios_render_geometry_invalid( &rects, screen, style )) continue;
+        if (style & WS_MINIMIZE) NtUserShowWindow( hwnd, SW_RESTORE );
+        /* Restore may invoke application code, resize or destroy the window. */
+        if (!winios_render_window_eligible( hwnd, &pid, &owner ) || pid != work[i].pid || owner != tid ||
+            !get_window_rects( hwnd, COORDS_SCREEN, &rects, get_thread_dpi() )) continue;
+        if (get_window_long( hwnd, GWL_STYLE ) & WS_MINIMIZE) continue;
+        if (winios_render_geometry_invalid( &rects, screen, 0 ))
+        {
+            int ok = NtUserSetWindowPos( hwnd, 0, screen.left, screen.top,
+                                        screen.right - screen.left, screen.bottom - screen.top,
+                                        SWP_NOACTIVATE | SWP_NOZORDER );
+            dprintf( 2, "[render-window-repair] hwnd=%p pid=%04x normalized=%d\n", hwnd, (unsigned)pid, ok );
+        }
+    }
 }
 
 /* ============================================================ *

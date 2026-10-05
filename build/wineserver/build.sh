@@ -12,8 +12,9 @@ SHIMS_DIR="$REPO_ROOT/build/ntdll-unix/shims"
 OBJ_DIR="$BUILD_DIR/obj"
 mkdir -p "$OBJ_DIR"
 
-# Copy the base library if we don't have one yet
-if [ ! -f "$OBJ_DIR/libwineserver.a" ]; then
+# Incremental rebuilds need a previous archive; the default all build creates
+# every member from the pinned Wine source and iOS replacements below.
+if [ "${1:-all}" != all ] && [ ! -f "$OBJ_DIR/libwineserver.a" ]; then
     if [ -f "$APP_LIB" ]; then
         cp "$APP_LIB" "$OBJ_DIR/libwineserver.a"
     else
@@ -157,6 +158,23 @@ case "${1:-all}" in
                 compile_one "$BUILD_DIR/$src" "$name"
             fi
         done
+        echo "=== Building remaining Wine server sources ==="
+        BASE_OBJECTS=()
+        for src in "$WINE_SRC"/server/*.c; do
+            name=$(basename "$src" .c)
+            replaced=0
+            for entry in "${PATCHED_FILES[@]}"; do
+                [ "${entry##*:}" = "$name.o" ] && replaced=1
+            done
+            [ "$replaced" = 0 ] || continue
+            compile_one "$src" "$name"
+            BASE_OBJECTS+=("$OBJ_DIR/$name.o")
+        done
+        # Use a new archive so a stale member from another Wine revision cannot
+        # survive a full rebuild. The replacements are inserted below.
+        rm -f "$OBJ_DIR/libwineserver.a.new"
+        ar rcs "$OBJ_DIR/libwineserver.a.new" "${BASE_OBJECTS[@]}"
+        mv "$OBJ_DIR/libwineserver.a.new" "$OBJ_DIR/libwineserver.a"
         ;;
     request|main|mach|unicode)
         for entry in "${PATCHED_FILES[@]}"; do

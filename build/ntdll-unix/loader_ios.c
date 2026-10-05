@@ -3841,9 +3841,13 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
             extern void *ios_jit_translate_addr(void *addr);
             extern void ios_jit_sync_write(void *addr, size_t size);
 
+            CHILD_STAGE( "copy_child_ntdll" );
             if (ios_jit_copy_module_for_child(pLdrInitializeThunk, child_peb) != 0)
             {
-                dprintf(STDERR_FILENO, "[Wine child] ntdll copy FAILED — falling back to SHARED ntdll (module lists will collide!)\n");
+                /* The shared image's loader state belongs to the parent. A
+                 * failed allocation cannot grant this child permission to
+                 * mutate it or dispatch through another process's image. */
+                CHILD_BOOT_FAIL( "private ntdll copy failed; child cannot safely use the session image\n" );
             }
             else
             {

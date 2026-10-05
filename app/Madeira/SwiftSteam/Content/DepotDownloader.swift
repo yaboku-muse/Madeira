@@ -9,6 +9,11 @@
 import Foundation
 import zlib
 import CommonCrypto
+#if os(Linux)
+import Glibc
+#else
+import Darwin
+#endif
 
 /// Progress for one application install, across all of its depots.
 struct SteamDownloadProgress: Equatable, Sendable {
@@ -49,7 +54,6 @@ final class DepotDownloader {
     private let session: SteamCMSession
     private var depotKeys: [UInt32: Data] = [:]
     private var cdnAuthTokens: [String: String] = [:]  // "depot|host" -> "?auth=…" fragment
-    private let maxConcurrentChunks = 8
     private let attemptsPerChunk = 5
     private let hostPoolSize = 6
 
@@ -59,7 +63,7 @@ final class DepotDownloader {
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.timeoutIntervalForRequest = 30
         config.timeoutIntervalForResource = 300
-        config.httpMaximumConnectionsPerHost = 8
+        config.httpMaximumConnectionsPerHost = 16
         return URLSession(configuration: config)
     }()
 
@@ -73,12 +77,69 @@ final class DepotDownloader {
 
     // MARK: - Public API
 
+    /// Read-only control measurement using an owned depot's authorized chunks.
+    /// Key/manifest authorization remains the same as installation. No install
+    /// folder, journal or appmanifest is opened or written.
+    func nativeControl(_ app: SteamAppInfo) async throws -> [ContentControlTrial] {
+        let hosts: [String]
+        if let provider = contentHosts { hosts = try await provider(app.appID) }
+        else { hosts = try await contentServers(appID: app.appID) }
+        guard let host = hosts.first else { throw SteamError.chunkDownloadFailed("No content servers are available.") }
+        for depot in app.installDepots() {
+            try Task.checkCancellation()
+            guard let gid = depot.publicManifestID else { continue }
+            let key = try await depotKey(depotID: depot.depotID, appID: app.appID)
+            let contentApp = !app.freeToDownload ? (depot.fromApp ?? app.appID) : app.appID
+            let manifest = try await fetchManifest(depotID: depot.depotID, appID: contentApp,
+                manifestGID: gid, key: key, hosts: [host], cacheCustomExecutables: false)
+            let auth = await cdnAuthFragment(depotID: depot.depotID, appID: contentApp, host: host)
+            var requests: [ContentControlRequest] = []
+            var bytes: UInt64 = 0
+            var seen = Set<Data>()
+            sample: for file in manifest.files {
+                for chunk in file.chunks where chunk.compressedSize > 0 && seen.insert(chunk.sha).inserted {
+                    if requests.count == 256 || bytes == 64 * 1024 * 1024 { break sample }
+                    let size = UInt64(chunk.compressedSize)
+                    guard size <= 8 * 1024 * 1024 else { continue }
+                    guard bytes + size <= 64 * 1024 * 1024, requests.count < 256 else { continue }
+                    guard let url = URL(string: "\(host)/depot/\(depot.depotID)/chunk/\(chunk.shaHex)\(auth)") else {
+                        throw SteamError.chunkDownloadFailed("Invalid content URL.")
+                    }
+                    requests.append(ContentControlRequest(url: url, bytes: size))
+                    bytes += size
+                }
+            }
+            guard bytes >= 16 * 1024 * 1024 else { continue }
+            let hostname = URL(string: host)?.host ?? "unavailable"
+            SteamLog.event("[steam-control] begin app=\(app.appID) depot=\(depot.depotID) host=\(hostname) chunks=\(requests.count) bytes-per-trial=\(bytes) trials=3 concurrency=8")
+            let results = try await ContentControl.run(requests)
+            for (index, trial) in results.enumerated() {
+                SteamLog.event(String(format: "[steam-control] timing app=%u depot=%u host=%@ trial=%d completed=1 bytes=%llu seconds=%.6f MiBps=%.3f",
+                    app.appID, depot.depotID, hostname, index + 1, trial.bytes, trial.seconds,
+                    Double(trial.bytes) / trial.seconds / 1048576))
+            }
+            return results
+        }
+        throw SteamError.chunkDownloadFailed("This game's depots do not have a suitable 16 MiB control sample.")
+    }
+
     /// Download an app into `steamApps/common/<installdir>` and write its
     /// appmanifest. Returns the install folder. Throws CancellationError when
     /// the calling task is cancelled; completed chunks stay journaled.
     func install(_ app: SteamAppInfo, steamApps: URL,
+                 mergeExistingOwnerRecord: Bool = false,
                  ownedDepots: @escaping () async -> Set<UInt32>? = { nil },
                  progress report: @escaping (SteamDownloadProgress) -> Void) async throws -> URL {
+        let installStarted = ProcessInfo.processInfo.systemUptime
+        let installCPU = ContentProcessCPUInterval()
+        var totalFetchedBytes: UInt64 = 0
+        var completed = false
+        defer {
+            let wall = max(0.001, ProcessInfo.processInfo.systemUptime - installStarted)
+            SteamLog.event(String(format: "[steam-install] timing app=%u completed=%d fetched-bytes=%llu wall=%.3fs payload-MiBps=%.3f %@",
+                app.appID, completed ? 1 : 0, totalFetchedBytes, wall,
+                Double(totalFetchedBytes) / wall / 1048576, installCPU.report(wall: wall)))
+        }
         let depots = app.installDepots()
         guard !depots.isEmpty else { throw SteamError.depotNotFound(app.appID) }
         // Before the key requests, so a refused depot still has its selection logged.
@@ -172,25 +233,70 @@ final class DepotDownloader {
             let work = prepared.pending[index]
             let paths = prepared.paths[index]
             let existing = prepared.existing[index]
-            let maximum = maxConcurrentChunks, attempts = attemptsPerChunk
-            try await withThrowingTaskGroup(of: (UInt64, UInt64).self) { group in
+            let attempts = attemptsPerChunk
+            let depotStarted = ProcessInfo.processInfo.systemUptime
+            let depotCPU = ContentProcessCPUInterval()
+            var concurrency = ContentConcurrency(started: depotStarted)
+            defer {
+                for line in plan.networkMetrics.report(depotID: plan.depotID) { SteamLog.event(line) }
+            }
+            var timing = ChunkTiming()
+            var fetchedChunks = 0
+            var hostsUsed: [String: Int] = [:]
+            try await withThrowingTaskGroup(of: (UInt64, UInt64, ChunkTiming).self) { group in
                 var next = 0
+                var active = 0
                 func enqueue() {
                     guard next < work.count else { return }
                     let item = work[next]; next += 1
+                    active += 1
                     let chunk = plan.manifest.files[item.file].chunks[item.chunk]
                     let path = paths[item.file]
                     let verify = existing[item.file]
                     group.addTask {
-                        if verify, Self.chunkAlreadyPresent(chunk, path: path) { return (item.key, UInt64(chunk.compressedSize)) }
-                        try await Self.fetchChunk(chunk, plan: plan, path: path, attempts: attempts, seed: item.file &+ item.chunk)
-                        return (item.key, UInt64(chunk.compressedSize))
+                        var local = ChunkTiming()
+                        if verify, Self.chunkAlreadyPresent(chunk, path: path, timing: &local) {
+                            return (item.key, UInt64(chunk.compressedSize), local)
+                        }
+                        var measured = try await Self.fetchChunk(chunk, plan: plan, path: path,
+                                                                 attempts: attempts, seed: item.file &+ item.chunk)
+                        measured.resumeCheck = local.resumeCheck
+                        measured.resumeChecksum = local.resumeChecksum
+                        measured.resumeChecks = local.resumeChecks
+                        measured.resumeHits = local.resumeHits
+                        measured.resumeCheckedBytes = local.resumeCheckedBytes
+                        return (item.key, UInt64(chunk.compressedSize), measured)
                     }
                 }
-                for _ in 0..<min(maximum, work.count) { enqueue() }
-                for try await (key, bytes) in group {
+                while active < concurrency.limit && next < work.count { enqueue() }
+                for try await (key, bytes, chunkTiming) in group {
+                    active -= 1
                     journal.append(key)
                     state.doneBytes += bytes
+                    timing.resumeCheck += chunkTiming.resumeCheck
+                    timing.resumeChecksum += chunkTiming.resumeChecksum
+                    timing.resumeChecks += chunkTiming.resumeChecks
+                    timing.resumeHits += chunkTiming.resumeHits
+                    timing.resumeCheckedBytes += chunkTiming.resumeCheckedBytes
+                    if chunkTiming.fetchedBytes > 0 {
+                        totalFetchedBytes += chunkTiming.fetchedBytes
+                        fetchedChunks += 1
+                        timing.fetchedBytes += chunkTiming.fetchedBytes
+                        timing.network += chunkTiming.network
+                        timing.decode += chunkTiming.decode
+                        timing.decrypt += chunkTiming.decrypt
+                        timing.decompress += chunkTiming.decompress
+                        timing.checksum += chunkTiming.checksum
+                        timing.write += chunkTiming.write
+                        timing.retries += chunkTiming.retries
+                        hostsUsed[chunkTiming.host, default: 0] += 1
+                        if let change = concurrency.observe(now: ProcessInfo.processInfo.systemUptime,
+                                                            bytes: bytes, network: chunkTiming.network,
+                                                            processing: chunkTiming.decode + chunkTiming.write,
+                                                            retries: chunkTiming.retries) {
+                            SteamLog.event("[steam-depot] concurrency depot=\(plan.depotID) limit=\(concurrency.limit) reason=\(change)")
+                        }
+                    }
                     let now = Date()
                     if now.timeIntervalSince(lastReport) >= 0.25 {
                         lastReport = now
@@ -198,9 +304,22 @@ final class DepotDownloader {
                         if elapsed > 1 { state.bytesPerSecond = Double(state.doneBytes - resumedBytes) / elapsed }
                         report(state)
                     }
-                    enqueue()
+                    // A decrease drains existing tasks; it never cancels a valid
+                    // chunk or discards its write/journal result.
+                    while active < concurrency.limit && next < work.count { enqueue() }
                 }
             }
+            let wall = max(0.001, ProcessInfo.processInfo.systemUptime - depotStarted)
+            let mibPerSecond = Double(timing.fetchedBytes) / wall / 1_048_576
+            let hostSummary = hostsUsed.sorted { $0.key < $1.key }
+                .map { "\($0.key):\($0.value)" }.joined(separator: ",")
+            SteamLog.event(String(format: "[steam-depot] timing depot=%u fetched-chunks=%d fetched-bytes=%llu wall=%.2fs network-sum=%.2fs decode-sum=%.2fs decrypt-sum=%.2fs decompress-sum=%.2fs checksum-sum=%.2fs write-sum=%.2fs retries=%d MiBps=%.2f hosts=%@ concurrency-limit=%d resume-checks=%d resume-hits=%d resume-checked-bytes=%llu resume-check-sum=%.6fs resume-sha1-sum=%.6fs %@",
+                                  plan.depotID, fetchedChunks, timing.fetchedBytes, wall,
+                                  timing.network, timing.decode, timing.decrypt, timing.decompress,
+                                  timing.checksum, timing.write, timing.retries,
+                                  mibPerSecond, hostSummary, concurrency.peak,
+                                  timing.resumeChecks, timing.resumeHits, timing.resumeCheckedBytes,
+                                  timing.resumeCheck, timing.resumeChecksum, depotCPU.report(wall: wall)))
         }
 
         // 4. Install record. Sizes come from the manifests; no tree walk.
@@ -224,12 +343,21 @@ final class DepotDownloader {
                 .map { $0.filename.replacingOccurrences(of: "/", with: "\\") }
         }
         if !custom.isEmpty { SteamLog.event("[steam-record] custom-executables app=\(app.appID) custom=\(custom.count)") }
+        if mergeExistingOwnerRecord {
+            guard shared.isEmpty, custom.isEmpty else {
+                throw SteamFileError.invalid("Unsupported nested or customized shared installer content.")
+            }
+            try AppManifestWriter.mergeOwnerManifest(ownerAppID: app.appID, ownerName: app.name,
+                ownerBuildID: app.buildID, installDir: folderName, steamID: accountID,
+                steamAppsPath: steamApps.path, depots: own)
+        } else {
         try AppManifestWriter.writeManifest(
             appID: app.appID, name: app.name, installDir: folderName, buildID: app.buildID,
             steamID: accountID, sizeOnDisk: prepared.totalUncompressed,
             steamAppsPath: steamApps.path, installedDepots: own,
             sharedDepots: shared.map { ($0.depotID, Int(owners[UInt32($0.depotID)]!)) },
             customExecutables: custom)
+        }
         if !shared.isEmpty {
             var written = 0, skipped = 0
             for ownerID in Set(owners.values).sorted() {
@@ -250,6 +378,7 @@ final class DepotDownloader {
         }
         try? FileManager.default.removeItem(at: journalDir)
         SteamLog.event("[steam-depot] install complete app=\(app.appID) bytes=\(prepared.totalUncompressed) seconds=\(Int(Date().timeIntervalSince(started)))")
+        completed = true
         return installURL
     }
 
@@ -270,12 +399,31 @@ final class DepotDownloader {
         let auth: [String: String]
         let declaredSize: UInt64
         let health: ContentHostHealth
+        let networkMetrics = ContentNetworkMetrics()
     }
 
     struct WorkItem: Sendable {
         let file: Int
         let chunk: Int
         var key: UInt64 { UInt64(file) << 32 | UInt64(chunk) }
+    }
+
+    /// Sums of chunk work may overlap because chunk tasks run concurrently.
+    struct ChunkTiming: Sendable {
+        var network = 0.0
+        var decode = 0.0
+        var decrypt = 0.0
+        var decompress = 0.0
+        var checksum = 0.0
+        var write = 0.0
+        var retries = 0
+        var host = ""
+        var fetchedBytes: UInt64 = 0
+        var resumeCheck = 0.0
+        var resumeChecksum = 0.0
+        var resumeChecks = 0
+        var resumeHits = 0
+        var resumeCheckedBytes: UInt64 = 0
     }
 
     struct Prepared: Sendable {
@@ -370,7 +518,11 @@ final class DepotDownloader {
     /// A chunk's ID is the SHA-1 of its uncompressed bytes. When a file
     /// already had content (an update, or a resume without a journal), bytes
     /// that already match are kept instead of downloaded again.
-    private nonisolated static func chunkAlreadyPresent(_ chunk: DepotManifest.ChunkEntry, path: String) -> Bool {
+    private nonisolated static func chunkAlreadyPresent(_ chunk: DepotManifest.ChunkEntry, path: String,
+                                                        timing: inout ChunkTiming) -> Bool {
+        let started = ProcessInfo.processInfo.systemUptime
+        timing.resumeChecks += 1
+        defer { timing.resumeCheck += max(0, ProcessInfo.processInfo.systemUptime - started) }
         let length = Int(chunk.uncompressedSize)
         guard chunk.sha.count == Int(CC_SHA1_DIGEST_LENGTH), length > 0,
               length <= ContentDecryptor.maximumChunkBytes else { return false }
@@ -381,33 +533,68 @@ final class DepotDownloader {
         let read = buffer.withUnsafeMutableBytes { pread(fd, $0.baseAddress, length, off_t(chunk.offset)) }
         guard read == length else { return false }
         var digest = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
+        let hashStarted = ProcessInfo.processInfo.systemUptime
         _ = CC_SHA1(buffer, CC_LONG(length), &digest)
-        return Data(digest) == chunk.sha
+        timing.resumeChecksum += max(0, ProcessInfo.processInfo.systemUptime - hashStarted)
+        timing.resumeCheckedBytes += UInt64(length)
+        let matches = Data(digest) == chunk.sha
+        if matches { timing.resumeHits += 1 }
+        return matches
     }
 
     private nonisolated static func fetchChunk(_ chunk: DepotManifest.ChunkEntry, plan: DepotPlan,
-                                               path: String, attempts: Int, seed: Int) async throws {
+                                               path: String, attempts: Int, seed: Int) async throws -> ChunkTiming {
         var lastError: Error = SteamError.chunkDownloadFailed("No content server responded.")
+        var result = ChunkTiming()
+        var triedHosts = Set<String>()
+        plan.networkMetrics.beginChunk()
+        defer { plan.networkMetrics.endChunk() }
         for attempt in 0..<max(1, attempts) {
             try Task.checkCancellation()
-            // Healthy servers first, starting from a per-chunk offset.
-            let order = plan.health.order(plan.hosts, seed: seed)
-            let host = order[attempt % order.count]
+            // Try a different host before revisiting one. Re-ranking after a
+            // failure must not accidentally select that host again by index.
+            guard let host = plan.health.choose(plan.hosts, seed: seed, avoiding: triedHosts) else { throw lastError }
+            triedHosts.insert(host)
             let url = "\(host)/depot/\(plan.depotID)/chunk/\(chunk.shaHex)\(plan.auth[host] ?? "")"
             do {
-                let encrypted = try await download(url)
-                let data = try ContentDecryptor.processChunk(encryptedData: encrypted, depotKey: plan.key,
+                let encrypted: Data
+                let requestStarted = ProcessInfo.processInfo.systemUptime
+                do {
+                    let start = ProcessInfo.processInfo.systemUptime
+                    defer { result.network += ProcessInfo.processInfo.systemUptime - start }
+                    encrypted = try await download(url, metrics: plan.networkMetrics)
+                }
+                let requestSeconds = ProcessInfo.processInfo.systemUptime - requestStarted
+                result.fetchedBytes += UInt64(encrypted.count)
+                let data: Data
+                do {
+                    let start = ProcessInfo.processInfo.systemUptime
+                    var stages = ContentDecryptor.ProcessingTiming()
+                    defer {
+                        result.decode += ProcessInfo.processInfo.systemUptime - start
+                        result.decrypt += stages.decrypt
+                        result.decompress += stages.decompress
+                        result.checksum += stages.checksum
+                    }
+                    data = try ContentDecryptor.processChunk(encryptedData: encrypted, depotKey: plan.key,
                                                              expectedCRC: chunk.crc,
-                                                             expectedSize: Int(chunk.uncompressedSize))
+                                                             expectedSize: Int(chunk.uncompressedSize), timing: &stages)
+                }
                 guard data.count == Int(chunk.uncompressedSize) else { throw SteamError.checksumMismatch }
-                try write(data, to: path, offset: chunk.offset)
-                plan.health.recordSuccess(host)
-                return
+                do {
+                    let start = ProcessInfo.processInfo.systemUptime
+                    defer { result.write += ProcessInfo.processInfo.systemUptime - start }
+                    try write(data, to: path, offset: chunk.offset)
+                }
+                result.host = URL(string: host)?.host ?? "unknown"
+                plan.health.recordSuccess(host, bytes: encrypted.count, seconds: requestSeconds)
+                return result
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
                 if Task.isCancelled { throw CancellationError() }
                 lastError = error
+                result.retries += 1
                 plan.health.recordFailure(host, reason: failureReason(error))
                 SteamLog.trace("chunk attempt \(attempt + 1) failed: \(failureReason(error))")
                 if attempt + 1 < attempts { try await Task.sleep(nanoseconds: UInt64(attempt + 1) * 400_000_000) }
@@ -437,9 +624,11 @@ final class DepotDownloader {
         }
     }
 
-    private nonisolated static func download(_ urlString: String) async throws -> Data {
+    private nonisolated static func download(_ urlString: String, metrics: ContentNetworkMetrics? = nil) async throws -> Data {
         guard let url = URL(string: urlString) else { throw SteamError.chunkDownloadFailed("Invalid content URL.") }
-        let (data, response) = try await http.data(from: url)
+        metrics?.beginRequest()
+        defer { metrics?.endRequest() }
+        let (data, response) = try await http.data(from: url, delegate: metrics)
         guard let status = (response as? HTTPURLResponse)?.statusCode, (200...299).contains(status) else {
             throw SteamError.chunkDownloadFailed("Content server returned HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0).")
         }
@@ -449,7 +638,7 @@ final class DepotDownloader {
     // MARK: - Manifest
 
     private func fetchManifest(depotID: UInt32, appID: UInt32, manifestGID: UInt64,
-                               key: Data, hosts: [String]) async throws -> DepotManifest {
+                               key: Data, hosts: [String], cacheCustomExecutables: Bool = true) async throws -> DepotManifest {
         let requestCode = try await manifestRequestCode(depotID: depotID, appID: appID, manifestGID: manifestGID)
         var lastError: Error = SteamError.manifestFetchFailed("No content server returned the manifest.")
         for host in hosts.prefix(6) {
@@ -458,7 +647,7 @@ final class DepotDownloader {
             let code = requestCode == 0 ? "" : "/\(requestCode)"
             do {
                 let raw = try await Self.download("\(host)/depot/\(depotID)/manifest/\(manifestGID)/5\(code)\(auth)")
-                let cache = depotCache
+                let cache = cacheCustomExecutables ? depotCache : nil
                 return try await Task.detached(priority: .userInitiated) {
                     let (manifest, payload) = try Self.parseManifestKeepingPayload(raw, depotID: depotID, manifestGID: manifestGID, key: key)
                     // Valve's client reads a depot's manifest from steamapps/depotcache
@@ -714,21 +903,283 @@ final class DepotDownloader {
     }
 }
 
-/// Per-install content-server health. Chunks start on different servers
-/// (spreading load) and servers that keep failing move to the back of every
-/// chunk's rotation, instead of each chunk rediscovering a bad server.
+struct ContentControlRequest: Sendable {
+    let url: URL
+    let bytes: UInt64
+}
+
+struct ContentControlTrial: Codable, Sendable {
+    let bytes: UInt64
+    let seconds: Double
+}
+
+/// Direct URLSession control: bounded encrypted response downloads to temporary
+/// files, without Steam decode/assembly. Reuses connections on one CDN host.
+/// The caller supplies requests from a key-authorized, decrypted manifest.
+enum ContentControl {
+    static func run(_ requests: [ContentControlRequest]) async throws -> [ContentControlTrial] {
+        guard !requests.isEmpty, requests.count <= 256,
+              let host = requests.first?.url.host,
+              requests.allSatisfy({ $0.url.host == host && $0.bytes > 0 && $0.bytes <= 8 * 1024 * 1024 }),
+              requests.reduce(UInt64(0), { $0 + $1.bytes }) <= 64 * 1024 * 1024 else {
+            throw SteamError.chunkDownloadFailed("Invalid control sample.")
+        }
+        let config = URLSessionConfiguration.ephemeral
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.httpMaximumConnectionsPerHost = 8
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 300
+        let http = URLSession(configuration: config)
+        defer { http.invalidateAndCancel() }
+        var results: [ContentControlTrial] = []
+        for _ in 0..<3 {
+            try Task.checkCancellation()
+            let started = ProcessInfo.processInfo.systemUptime
+            let bytes = try await withThrowingTaskGroup(of: UInt64.self) { group in
+                var next = 0
+                func enqueue() {
+                    let request = requests[next]
+                    next += 1
+                    group.addTask {
+                        try Task.checkCancellation()
+                        let (file, response) = try await http.download(from: request.url)
+                        defer { try? FileManager.default.removeItem(at: file) }
+                        try Task.checkCancellation()
+                        guard let response = response as? HTTPURLResponse,
+                              response.statusCode == 200, response.url?.host == host,
+                              let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                              UInt64(size) == request.bytes else {
+                            throw SteamError.chunkDownloadFailed("Control response did not match its authorized sample.")
+                        }
+                        return UInt64(size)
+                    }
+                }
+                for _ in 0..<min(8, requests.count) { enqueue() }
+                var total: UInt64 = 0
+                while let count = try await group.next() {
+                    total += count
+                    if next < requests.count { enqueue() }
+                }
+                return total
+            }
+            let wall = max(0.000001, ProcessInfo.processInfo.systemUptime - started)
+            results.append(ContentControlTrial(bytes: bytes, seconds: wall))
+        }
+        return results
+    }
+}
+
+/// CPU time of the entire Mach process, not attribution to one download task.
+/// One core fully occupied for one wall second reports one average core;
+/// concurrent cores can legitimately make this larger than one.
+struct ContentProcessCPUInterval {
+    private let began = Self.readSeconds()
+
+    private static func readSeconds() -> Double? {
+        var usage = rusage()
+        #if os(Linux)
+        let who = Int32(RUSAGE_SELF.rawValue)
+        #else
+        let who = RUSAGE_SELF
+        #endif
+        guard getrusage(who, &usage) == 0 else { return nil }
+        return Double(usage.ru_utime.tv_sec) + Double(usage.ru_utime.tv_usec) / 1000000 +
+               Double(usage.ru_stime.tv_sec) + Double(usage.ru_stime.tv_usec) / 1000000
+    }
+
+    func report(wall: Double) -> String {
+        guard wall.isFinite, wall > 0, let began, let ended = Self.readSeconds(),
+              ended >= began, (ended - began).isFinite, ((ended - began) / wall).isFinite else {
+            return "process-cpu=unavailable"
+        }
+        return String(format: "process-cpu-seconds=%.6fs process-cpu-cores=%.3f", ended - began, (ended - began) / wall)
+    }
+}
+
+/// Completion-driven tuning, owned by the task-group consumer. Uses useful
+/// compressed bytes per wall second, excluding resumed chunks and retry bytes.
+/// Processing durations are load proxies, not a measurement of CPU utilization.
+struct ContentConcurrency {
+    private(set) var limit = 8
+    private(set) var peak = 8
+    private var started: Double
+    private var chunks = 0
+    private var bytes = 0.0
+    private var network = 0.0
+    private var processing = 0.0
+    private var retries = 0
+    private var probe: (limit: Int, rate: Double)?
+    private var cooldown = 0
+
+    init(started: Double) { self.started = started }
+
+    mutating func observe(now: Double, bytes usefulBytes: UInt64, network networkTime: Double,
+                          processing processingTime: Double, retries retryCount: Int) -> String? {
+        guard now.isFinite, now >= started, networkTime.isFinite, networkTime >= 0,
+              processingTime.isFinite, processingTime >= 0, retryCount >= 0,
+              usefulBytes > 0 else { return nil }
+        chunks += 1
+        bytes += Double(usefulBytes)
+        network += networkTime
+        processing += processingTime
+        retries += retryCount
+        let elapsed = now - started
+        // Observe a full batch and at least two seconds before judging it.
+        guard chunks >= limit, elapsed >= 2 else { return nil }
+        let rate = bytes / elapsed
+        let retryPressure = retries >= max(2, chunks / 4)
+        let processingPressure = processing > network && processing > 0
+        started = now
+        chunks = 0; bytes = 0; network = 0; processing = 0; retries = 0
+        if retryPressure || processingPressure {
+            probe = nil
+            cooldown = 2
+            let reduced = retryPressure ? max(2, limit / 2) : max(2, limit - 2)
+            guard reduced != limit else { return nil }
+            limit = reduced
+            return retryPressure ? "retries" : "processing"
+        }
+        if let previous = probe {
+            probe = nil
+            // Keep a larger batch only when it improved useful throughput.
+            if rate < previous.rate * 1.05 {
+                limit = previous.limit
+                cooldown = 2
+                return "probe-no-gain"
+            }
+            return "probe-gain"
+        }
+        if cooldown > 0 { cooldown -= 1; return nil }
+        guard limit < 16 else { return nil }
+        probe = (limit, rate)
+        limit = min(16, limit + 2)
+        peak = max(peak, limit)
+        return "probe"
+    }
+}
+
+/// Chunk-request measurements shared by one depot. Delegate callbacks and
+/// download tasks may run concurrently; all mutable state is protected by lock.
+/// Keep only hostnames and numeric fields, never URLs or authorization headers.
+final class ContentNetworkMetrics: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private struct Samples {
+        var count = 0
+        var seconds = 0.0
+        mutating func add(_ start: Date?, _ end: Date?) {
+            guard let start, let end else { return }
+            let elapsed = end.timeIntervalSince(start)
+            guard elapsed.isFinite, elapsed >= 0 else { return }
+            count += 1
+            seconds += elapsed
+        }
+        var description: String {
+            count == 0 ? "unavailable" : String(format: "%.3fs/%d", seconds, count)
+        }
+    }
+    private struct Host {
+        var transactions = 0, reused = 0
+        var responseBytes: Int64 = 0
+        var dns = Samples(), connect = Samples(), tls = Samples(), ttfb = Samples()
+        var protocols: [String: Int] = [:]
+        var statuses: [Int: Int] = [:]
+    }
+    private let lock = NSLock()
+    private var hosts: [String: Host] = [:]
+    private var requests = 0, completed = 0, callbacks = 0
+    private var activeRequests = 0, peakRequests = 0
+    private var activeChunks = 0, peakChunks = 0
+
+    func beginChunk() {
+        lock.lock(); defer { lock.unlock() }
+        activeChunks += 1; peakChunks = max(peakChunks, activeChunks)
+    }
+    func endChunk() {
+        lock.lock(); defer { lock.unlock() }; activeChunks -= 1
+    }
+    func beginRequest() {
+        lock.lock(); defer { lock.unlock() }
+        requests += 1; activeRequests += 1; peakRequests = max(peakRequests, activeRequests)
+    }
+    func endRequest() {
+        lock.lock(); defer { lock.unlock() }; completed += 1; activeRequests -= 1
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+        lock.lock(); defer { lock.unlock() }
+        callbacks += 1
+        for metric in metrics.transactionMetrics {
+            let hostname = metric.request.url?.host ?? "unknown"
+            var host = hosts[hostname] ?? Host()
+            host.transactions += 1
+            if metric.isReusedConnection { host.reused += 1 }
+            host.responseBytes += max(0, metric.countOfResponseBodyBytesReceived)
+            host.dns.add(metric.domainLookupStartDate, metric.domainLookupEndDate)
+            host.connect.add(metric.connectStartDate, metric.connectEndDate)
+            host.tls.add(metric.secureConnectionStartDate, metric.secureConnectionEndDate)
+            host.ttfb.add(metric.fetchStartDate, metric.responseStartDate)
+            let value = metric.networkProtocolName ?? "unknown"
+            let protocolName = ["http/1.0", "http/1.1", "h2", "h3"].contains(value) ? value : "other"
+            host.protocols[protocolName, default: 0] += 1
+            host.statuses[(metric.response as? HTTPURLResponse)?.statusCode ?? 0, default: 0] += 1
+            hosts[hostname] = host
+        }
+    }
+
+    func report(depotID: UInt32) -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        var lines = ["[steam-depot] network depot=\(depotID) requests=\(requests) completed=\(completed) metrics-callbacks=\(callbacks) active-requests=\(activeRequests) peak-active-requests=\(peakRequests) active-chunks=\(activeChunks) peak-active-chunks=\(peakChunks)"]
+        for name in hosts.keys.sorted() {
+            let host = hosts[name]!
+            let protocols = host.protocols.keys.sorted().map { "\($0):\(host.protocols[$0]!)" }.joined(separator: ",")
+            let statuses = host.statuses.keys.sorted().map { "\($0):\(host.statuses[$0]!)" }.joined(separator: ",")
+            lines.append("[steam-cdn] timing depot=\(depotID) host=\(name) transactions=\(host.transactions) reused=\(host.reused) dns=\(host.dns.description) connect=\(host.connect.description) tls=\(host.tls.description) ttfb=\(host.ttfb.description) response-bytes=\(host.responseBytes) protocols=\(protocols) statuses=\(statuses)")
+        }
+        return lines
+    }
+}
+
+/// Per-install content-server health and observed valid-payload HTTP rates.
+/// Failure counts take precedence. Healthy unsampled hosts get initial trials;
+/// one in eight selections explores a healthy peer to refresh its rate.
 final class ContentHostHealth: @unchecked Sendable {
     private let lock = NSLock()
     private var failures: [String: Int] = [:]
+    private var rates: [String: Double] = [:]
+    private var selections = 0
     private var reported = 0
 
     func order(_ hosts: [String], seed: Int) -> [String] {
         guard !hosts.isEmpty else { return hosts }
-        let rotated = (0..<hosts.count).map { hosts[($0 + seed) % hosts.count] }
-        lock.lock(); let counts = failures; lock.unlock()
-        return rotated.enumerated()
-            .sorted { ((counts[$0.element] ?? 0), $0.offset) < ((counts[$1.element] ?? 0), $1.offset) }
-            .map(\.element)
+        let offset = ((seed % hosts.count) + hosts.count) % hosts.count
+        let rotated = (0..<hosts.count).map { hosts[($0 + offset) % hosts.count] }
+        lock.lock()
+        let counts = failures, observed = rates
+        selections &+= 1
+        let selection = selections
+        lock.unlock()
+        var ordered = rotated.enumerated().sorted {
+            let a = counts[$0.element] ?? 0, b = counts[$1.element] ?? 0
+            if a != b { return a < b }
+            let ar = observed[$0.element], br = observed[$1.element]
+            // Obtain a rate before judging a healthy server's performance.
+            if (ar == nil) != (br == nil) { return ar == nil }
+            if let ar, let br, ar != br { return ar > br }
+            return $0.offset < $1.offset
+        }.map(\.element)
+        if selection > 0 && selection % 8 == 0 {
+            let lowest = counts[ordered[0]] ?? 0
+            let peers = rotated.filter { (counts[$0] ?? 0) == lowest }
+            let probe = peers[(selection / 8 - 1) % peers.count]
+            ordered.removeAll { $0 == probe }
+            ordered.insert(probe, at: 0)
+        }
+        return ordered
+    }
+
+    func choose(_ hosts: [String], seed: Int, avoiding tried: Set<String>) -> String? {
+        let ordered = order(hosts, seed: seed)
+        return ordered.first { !tried.contains($0) } ?? ordered.first
     }
 
     func recordFailure(_ host: String, reason: String) {
@@ -743,9 +1194,15 @@ final class ContentHostHealth: @unchecked Sendable {
         }
     }
 
-    func recordSuccess(_ host: String) {
+    func recordSuccess(_ host: String, bytes: Int = 0, seconds: Double = 0) {
         lock.lock()
         if let count = failures[host], count > 0 { failures[host] = count - 1 }
+        if bytes > 0, seconds.isFinite, seconds > 0 {
+            let rate = Double(bytes) / seconds
+            if rate.isFinite {
+                rates[host] = rates[host].map { $0 * 0.75 + rate * 0.25 } ?? rate
+            }
+        }
         lock.unlock()
     }
 }

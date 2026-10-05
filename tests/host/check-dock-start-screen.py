@@ -57,7 +57,7 @@ require('/* DockStartScreen.swift in Sources */,' in project and 'path = "DockSt
 require(re.search(r'\bView\b|SwiftUI|MadeiraDock\.|MadeiraConfig|getenv', rules.replace('// MARK: - Rules', '')) is None,
         'the rules are Foundation-only and pure (switches are passed in)')
 for text in (screen, winios[winios.index('Top-level window census'):winios.index('void winios_pDestroyWindow(HWND hwnd)')]):
-    require(not re.findall(r'"[^"\n]*\.exe"', text), 'no program names in the rules or the census')
+    require(not re.findall(r'"[^"\n]+\.exe"', text), 'no program names in the rules or the census (bare extension filters allowed)')
 require('clientImages' not in screen and 'helperImages' not in screen and 'helperPrefixes' not in screen,
         'no program-name lists: owners are classed by folder')
 require('library.begin(.dockSession(title: game.name, width: width, height: height), remember: false, dock: game)' in content
@@ -79,6 +79,24 @@ require('if dockStart.failure != nil {' in row and 'if dockStart.holding {' in r
         'close session only once the Dock stopped; show desktop only while the desktop is held back')
 require('Text("Madeira Dock stopped")' in library and 'DockInstallers.note' in library and 'DockStartStatus.text(' in library,
         'the starting screen shows the Dock status, the one-time-install note, and a stop with its words')
+require('if let warning = dockStart.progressWarning {' in library and 'dockStart.loaderDiagnostic.map' in library and
+        'let warning = hostStarted ? progress.warning(now: elapsed) : nil' in screen and
+        'progress = SteamLaunchProgress(startedAt: elapsed)' in screen,
+        'recoverable stage warning reaches the starting screen and excludes one-time installer duration')
+store = (app / 'LogStore.swift').read_text(encoding='utf-8')
+capture = store[store.index('private func handleRawLine'):store.index('// Filter out lines')]
+require(capture.index('SteamLoaderRejection.parse(raw)') < capture.index('if suppressed { return }') and
+        'raw.contains("[dll-missing]")' in capture and
+        'let pause = suppress && !launchDiagnosticsActive' in store and
+        'let pause = displaySuppressed && !active' in store and
+        'LogStore.shared.setLaunchDiagnosticsActive(true)' in screen and
+        'LogStore.shared.setLaunchDiagnosticsActive(false)' in screen,
+        'startup diagnostic capture survives hidden live log and stops with the launch hold')
+require(capture.index('trackedLaunchLifetime?.consume(raw)') < capture.index('if suppressed { return }') and
+        'LogStore.shared.trackLaunchExecutable(game == nil ? nil : MadeiraDock.launchImage)' in screen and
+        'executableCreated: hostStarted && creation != nil' in screen and
+        'expectedImage: launchImage' in content and 'if let created = dockStart.executableStatus' in library,
+        'exact chosen executable evidence reaches the UI before hidden-log suppression')
 status = library[library.index('    private var dockStatus: String {'):]
 status = status[:status.index('\n    }\n')]
 require(status.index('DockInstallers.poll(drive: MadeiraDock.drive)') < status.index('DockInstallers.finishedAt ?? model.launchStartedAt')
@@ -98,10 +116,13 @@ destroy = winios[winios.index('void winios_pDestroyWindow(HWND hwnd) {'):]
 destroy = destroy[:destroy.index('\n}\n')]
 require('atomic_compare_exchange_strong(&g_restore_foreground, &pending, 0)' in destroy and 'winios_census_forget(hwnd)' in destroy,
         'a destroyed window leaves the census and any pending front request')
-require(winios.count('winios_census_note_frame(hwnd, x, y, w, h, visible);') == 1 and
+require(winios.count('winios_census_note_frame(hwnd, x, y, w, h, visible);') == 2 and
         winios.count('winios_census_note_present(hwnd);') == 1 and winios.count('winios_census_note_metal((HWND)hwnd);') == 1,
         'the census is fed by the frame, GDI flush and swapchain hooks')
 require('#include "Winios.h"' in winios, 'Winios.m includes the header Swift reads the census struct from')
+game_metal = winios[winios.index('void winios_note_game_metal_hwnd(void *hwnd) {'):]
+require(game_metal.index('winios_census_note_game_metal((HWND)hwnd);') < game_metal.index('dispatch_async('),
+        'game swapchain geometry is queried on the Wine thread before UIKit dispatch')
 
 # ------------------------------------------------------------------ 1. Swift
 checks = r'''
@@ -224,6 +245,143 @@ func window(_ image: String, _ w: Int, _ h: Int, visible: Bool = true, drawn: Bo
                 "a flapping dialog stops toggling and stays shown (reveals=\(reveals) covers=\(covers))")
 
         // --- The status line: the furthest stage the host reported.
+        let rejected = SteamLoaderRejection.parse(#"00b0:err:module:[pe-image] section rejected L"C:\Program Files (x86)\Steam\SDL3.dll" status=c000007b"#)
+        require(rejected?.module == "SDL3.dll" && rejected?.phase == "section" && rejected?.status == "C000007B", "exact loader stage, basename and status")
+        require(rejected?.text.contains("0xC000007B") == true && rejected?.text.contains("Program Files") == false, "UI diagnostic retains status without private paths")
+        let arch = SteamLoaderRejection.parse(#"[pe-image] architecture rejected L"C:\Steam\SDL3.dll" file_machine=8664 current_machine=a641 wow_teb=0 code=1"#)
+        require(arch?.status == nil && arch?.fileMachine == "8664" && arch?.currentMachine == "A641", "architecture record uses measured machines, not invented status")
+        let suppliedArch = SteamLoaderRejection.parse(#"[pe-image] architecture rejected L"C:\Steam\SDL3.dll" file_machine=014c current_machine=8664 wow_teb=0 code=1"#)
+        require(suppliedArch?.fileMachine == "014C" && suppliedArch?.currentMachine == "8664", "supplied x86 DLL in AMD64 caller retains exact machine evidence")
+        for header in ["ml718 UNCAPPED", "rev=ml336 #123"] {
+            let line = "0024:err:module:load_dll [dll-missing] " + header + #" L"C:\private\Steam\SDL3.dll" status=c000007b -- loader detail"#
+            let final = SteamLoaderRejection.parse(line)
+            require(final?.module == "SDL3.dll" && final?.phase == "dependency resolution" && final?.status == "C000007B", "final loader resolution status: " + header)
+            require(final?.text.contains("private") == false && final?.fileMachine == nil, "resolution does not retain paths or invent architecture")
+        }
+        require(SteamLoaderRejection.parse(#"[dll-missing] ml718 UNCAPPED L"C:\Steam\video64.dll" status=c0000135 (subsystem dependency)"#)?.status == "C0000135", "dependency not found status is explicit")
+        for ending in ["\r\n", "\n", "\r"] {
+            require(SteamLoaderRejection.parse(#"[dll-missing] rev=ml336 #3 L"SDL3.dll" status=c000007b"# + ending)?.status == "C000007B", "native callback line terminator is accepted")
+        }
+        for detail in ["status=00000000", "status=bogus", "status=c000007b status=c0000135"] {
+            require(SteamLoaderRejection.parse("[dll-missing] rev=ml336 #1 " + #"L"C:\Steam\SDL3.dll" "# + detail) == nil, "reject invalid or ambiguous resolution: " + detail)
+        }
+        require(SteamLoaderRejection.parse(#"[dll-missing] unknown L"C:\Steam\SDL3.dll" status=c000007b"#) == nil, "only the production loader record formats are captured")
+        require(SteamLoaderRejection.parse("prefix\n" + #"[pe-image] section rejected L"C:\Steam\SDL3.dll" status=c000007b"#) == nil, "reject multiline records")
+        for phase in ["map", "module setup", "PE64 conversion"] {
+            let line = "[pe-image] " + phase + #" rejected L"C:\Steam\video64.dll" status=c000007b machine=8664"#
+            require(SteamLoaderRejection.parse(line)?.phase == phase, "parse loader phase " + phase)
+        }
+        require(SteamLoaderRejection.parse(#"[pe-image] section rejected L"C:\Steam\SDL3.dll" status=success"#) == nil, "reject malformed status")
+        require(SteamLoaderRejection.parse(#"[pe-image] section rejected L"C:\Steam\SDL3.dll" status=c000007b status=c0000005"#) == nil, "reject ambiguous status")
+        require(SteamLoaderRejection.parse(#"[pe-image] architecture rejected L"C:\Steam\SDL3.dll" file_machine=8664 current_machine=bogus"#) == nil, "reject malformed architecture")
+        require(SteamLoaderRejection.parse(#"[pe-image] section rejected L"C:\private\token.txt" status=c000007b"#) == nil, "only module filenames are captured")
+        require(SteamLoaderRejection.parse(String(repeating: "x", count: 4097)) == nil, "bounded input")
+        require(SteamLoaderRejection.parse("ordinary log line") == nil, "ignore unrelated logs")
+        let selectedImage = #"C:\Games\Fixture\Game.exe"#
+        func createdRecord(_ image: String) -> String {
+            "[process-created] pid=000000ab tid=000000cd status=00000000 image_utf16=" + image.utf16.map { String(format: "%04x", $0) }.joined()
+        }
+        func birth(_ image: String, pid: UInt32, generation: UInt64) -> String {
+            "[process-created] pid=\(String(format: "%08x", pid)) tid=000000cd status=00000000 generation=\(String(format: "%016llx", generation)) image_utf16=" + image.utf16.map { String(format: "%04x", $0) }.joined()
+        }
+        func death(_ pid: UInt32, _ generation: UInt64, _ code: UInt32 = 0, windows: Bool = true) -> String {
+            "[process-exited] pid=\(String(format: "%08x", pid)) generation=\(String(format: "%016llx", generation)) status_kind=\(windows ? "windows" : "unix") status=\(String(format: "%08x", code))"
+        }
+        let hostImage = #"C:\windows\system32\dockhost.exe"#
+        var lifetime = SteamLaunchLifetime(expectedGame: selectedImage, expectedHost: hostImage)
+        lifetime.consume(death(0xab, 1, 0xc0000005)) // immediate child exit precedes parent creation acknowledgement
+        require(lifetime.gameExit == nil && lifetime.hostExit == nil, "unmatched exits do not imply game or Steam failure")
+        lifetime.consume(birth(selectedImage, pid: 0xab, generation: 1))
+        require(lifetime.gameExit?.status == 0xc0000005 && lifetime.gameCreation?.generation == 1, "correlate early exit by exact PID and birth generation")
+        lifetime.consume(birth(selectedImage, pid: 0xab, generation: 2))
+        lifetime.consume(birth(selectedImage, pid: 0xab, generation: 1)) // delayed file tail after newer direct callback
+        lifetime.consume(createdRecord(selectedImage))
+        require(lifetime.gameExit == nil, "recycled PID never inherits prior generation exit")
+        require(lifetime.gameCreation?.generation == 2, "delayed old or legacy file records cannot replace current callback birth")
+        lifetime.consume(death(0xab, 1, 0xc0000005))
+        require(lifetime.gameExit == nil, "late old-generation exit does not terminate new game")
+        lifetime.consume(birth(#"C:\windows\system32\steamerrorreporter64.exe"#, pid: 0xac, generation: 3))
+        lifetime.consume(death(0xac, 3, 0xc0000005))
+        require(lifetime.hostExit == nil, "reporter failure is not Steam host failure")
+        lifetime.consume(birth(hostImage, pid: 0xad, generation: 4))
+        lifetime.consume(death(0xad, 4, 0xc0000005))
+        require(lifetime.hostExit?.reportsFault == true && lifetime.hostExit?.statusText == "Windows status 0xc0000005", "actual embedded Steam host fault retains full status")
+        var failedHost = SteamLaunchProgress()
+        require(failedHost.step([:], programObserved: true, rendered: true, now: 1, hostExit: lifetime.hostExit) && failedHost.stage == .steamCrashed, "native host fault outranks stale rendered window")
+        require(failedHost.warning(now: 10000) == nil, "crashed host has no running-stage timeout")
+        let unixFailure = SteamProcessExit.parse(death(0xad, 4, 0xc0000005, windows: false))!
+        require(!unixFailure.reportsFault, "Unix exit code is not a Windows exception")
+        require(failedHost.step([:], programObserved: false, rendered: false, now: 2, hostExit: unixFailure) && failedHost.stage == .hostFailed, "nonfault host error stays explicit without inventing a crash")
+        let clean = SteamProcessExit.parse(death(0xab, 2))!
+        require(failedHost.step([:], programObserved: true, rendered: true, now: 3, gameExit: clean) && failedHost.stage == .exited, "native selected executable exit outranks stale window")
+        lifetime.consume(death(0xab, 2))
+        for n in 10...280 { lifetime.consume(death(UInt32(n), UInt64(n))) }
+        lifetime.consume(birth(selectedImage, pid: 0xab, generation: 2))
+        lifetime.consume(birth(hostImage, pid: 0xad, generation: 4))
+        require(lifetime.gameExit == clean && lifetime.hostExit?.reportsFault == true, "resolved exits survive bounded early-exit cache eviction")
+        for suffix in ["", "\n", "\r", "\r\n"] {
+            require(SteamProcessExit.parse(death(0xab, 2) + suffix) == clean, "native exit line-ending forms")
+        }
+        for invalid in [death(0, 1), death(1, 0), death(1, 1) + " extra", "prefix " + death(1, 1),
+                        death(1, 1) + "\n" + death(1, 1), death(1, 1).replacingOccurrences(of: "windows", with: "unknown")] {
+            require(SteamProcessExit.parse(invalid) == nil, "reject malformed or uncorrelatable exit record")
+        }
+        var legacy = SteamLaunchLifetime(expectedGame: selectedImage, expectedHost: hostImage)
+        legacy.consume(createdRecord(selectedImage)); legacy.consume(death(0xab, 1))
+        require(legacy.gameCreation != nil && legacy.gameExit == nil, "legacy creation still works without guessing an exit generation")
+        let created = SteamExecutableCreation.parse(createdRecord(#"\??\C:\Games\Fixture\Game.exe"#), expectedImage: selectedImage)
+        require(created?.pid == 0xab && created?.tid == 0xcd && created?.module == "Game.exe", "server creation matches the complete selected image")
+        require(created?.text.contains("Fixture") == false && created?.text.contains("0xab") == true, "creation UI retains basename/PID without private path")
+        require(SteamExecutableCreation.parse(createdRecord(#"c:/games/fixture/game.exe"#), expectedImage: selectedImage) != nil, "case and Windows slash forms match")
+        for wrong in [#"C:\Other\Game.exe"#, #"C:\Games\Fixture\Helper.exe"#, #"C:\Games\Fixture\..\Fixture\Game.exe"#, "relative/Game.exe"] {
+            require(SteamExecutableCreation.parse(createdRecord(wrong), expectedImage: selectedImage) == nil, "different executable identity is not game creation")
+        }
+        let unicodeImage = #"C:\Games\é🚀\Game.exe"#
+        require(SteamExecutableCreation.parse(createdRecord(unicodeImage), expectedImage: unicodeImage) != nil, "Unicode and paired surrogates preserve identity")
+        let decomposedImage = "C:\\Games\\e\u{301}🚀\\Game.exe"
+        require(SteamExecutableCreation.parse(createdRecord(decomposedImage), expectedImage: unicodeImage) == nil, "do not conflate distinct Unicode path encodings")
+        let encoded = createdRecord(selectedImage)
+        for ending in ["", "\r\n", "\r", "\n"] {
+            require(SteamExecutableCreation.parse(encoded + ending, expectedImage: selectedImage) != nil, "creation callback/file line endings")
+        }
+        for bad in [encoded.replacingOccurrences(of: "status=00000000", with: "status=c000007b"),
+                    encoded.replacingOccurrences(of: "pid=000000ab", with: "pid=00000000"),
+                    encoded.replacingOccurrences(of: "tid=000000cd", with: "tid=garbage"), encoded + "f", encoded + "\n\n",
+                    "prefix" + encoded, encoded + " status=00000000", String(repeating: "x", count: 4097),
+                    "[process-created] pid=000000ab tid=000000cd status=00000000 image_utf16=d800"] {
+            require(SteamExecutableCreation.parse(bad, expectedImage: selectedImage) == nil, "reject malformed, failed, ambiguous or multiline creation")
+        }
+        var createdTracker = SteamLaunchProgress()
+        require(createdTracker.step(["launch-request-submitted": "1"], programObserved: false, rendered: false, now: 1, executableCreated: true) && createdTracker.stage == .executableCreated,
+                "confirmed executable creation is separate from a request/window")
+        require(createdTracker.warning(now: 180) == nil && createdTracker.warning(now: 181)?.contains("selected executable was created") == true, "created-but-windowless deadline")
+        require(!createdTracker.step([:], programObserved: false, rendered: false, now: 182, executableCreated: true), "repeated creation evidence does not reset deadline")
+        require(createdTracker.step([:], programObserved: true, rendered: false, now: 183, executableCreated: true) && createdTracker.stage == .programObserved, "window observation advances beyond executable creation")
+        require(createdTracker.step(["launch-game-ended": "1"], programObserved: false, rendered: false, now: 184, executableCreated: true) && createdTracker.stage == .exited, "exit outranks retained creation")
+        var tracker = SteamLaunchProgress()
+        require(tracker.warning(now: 59) == nil && tracker.warning(now: 60) != nil, "startup warning boundary")
+        require(tracker.step(["session-authenticated-online": "1"], programObserved: false, rendered: false, now: 61), "authentication advances stage")
+        require(tracker.warning(now: 180) == nil && tracker.warning(now: 181) != nil, "timeout measures this stage")
+        let contentFields = ["launch-update-wait": "17", "launch-client-error": "17"]
+        require(tracker.step(contentFields, programObserved: false, rendered: false, now: 182), "content wait advances stage")
+        require(!tracker.step(contentFields.merging(["launch-update-retry": "99"]) { $1 }, programObserved: false, rendered: false, now: 700), "retries do not restart deadline")
+        require(tracker.warning(now: 781) == nil && tracker.warning(now: 782)?.contains("required content") == true, "content warning boundary")
+        require(tracker.step(["launch-request-submitted": "1"], programObserved: false, rendered: false, now: 783), "request recovers from content warning")
+        require(tracker.stage == .requested && tracker.warning(now: 783) == nil, "progress clears previous warning")
+        require(!tracker.step(["launch-game-running": "1"], programObserved: false, rendered: false, now: 800) && tracker.stage == .requested,
+                "Steam running bit does not prove executable creation")
+        require(tracker.step([:], programObserved: true, rendered: false, now: 801) && tracker.stage == .programObserved, "census proves a program window exists")
+        require(tracker.step([:], programObserved: true, rendered: true, now: 802) && tracker.stage == .rendered && tracker.warning(now: 10000) == nil,
+                "rendered game clears warnings without a time limit")
+        require(!tracker.step([:], programObserved: false, rendered: false, now: .nan) && tracker.stage == .rendered, "invalid time ignored")
+        require(!tracker.step([:], programObserved: false, rendered: false, now: 1) && tracker.stage == .rendered, "backward time ignored")
+        require(tracker.step(["launch-game-ended": "1"], programObserved: true, rendered: true, now: 803) && tracker.stage == .exited, "exit outranks old render observations")
+        require(tracker.step(["probe-result": "30"], programObserved: true, rendered: true, now: 804) && tracker.stage == .hostEnded,
+                "host result is terminal evidence, not an inferred Steam crash")
+        var afterInstaller = SteamLaunchProgress(startedAt: 900)
+        require(afterInstaller.warning(now: 959) == nil && afterInstaller.warning(now: 960) != nil, "installer duration excluded from startup deadline")
+        require(afterInstaller.step(["launch-request-submitted": "0"], programObserved: false, rendered: false, now: 961) == false,
+                "failed request submission does not advance stage")
         typealias D = DockStartStatus
         func text(_ fields: [String: String], installers: Bool = false, progress: String? = nil, finished: Bool = false,
                   waited: Double = 5) -> String {
@@ -352,6 +510,14 @@ int winios_drv_process_image(unsigned int pid, char *out, unsigned int size) {
 }
 int winios_drv_post_restore(HWND hwnd) { atomic_fetch_add(&restores, 1); last_restore = hwnd; return 1; }
 int winios_drv_foreground_if_owner(HWND hwnd) { return hwnd ? 1 : 0; }
+static int render_x, render_y, render_w = 640, render_h = 480;
+int winios_drv_census_rect(HWND hwnd, int *x, int *y, int *w, int *h, int *visible) {
+    struct fake *f = lookup(hwnd);
+    if (!f || !f->top) return 0;
+    *x = render_x; *y = render_y; *w = render_w; *h = render_h;
+    *visible = !!(f->style & 0x10000000);
+    return 1;
+}
 static HWND add(unsigned long h, unsigned style, int top, unsigned pid) {
     fakes[nfakes] = (struct fake){ (HWND)h, style, top, pid };
     return fakes[nfakes++].hwnd;
@@ -444,6 +610,22 @@ int main(int argc, char **argv) {
     n = winios_window_census(out, WINIOS_CENSUS_MAX);
     CHECK(n == 5 && !find(game, n) && find(game2, n), "destroyed windows leave");
     CHECK(winios_window_census(out, 2) == 2, "copy is bounded by the caller");
+
+    HWND early = add(0x6000, 0x94000000, 1, 0x44);
+    render_x = render_y = -32000; render_w = render_h = 0;
+    winios_census_note_game_metal(early);
+    n = winios_window_census(out, WINIOS_CENSUS_MAX);
+    CHECK(find(early, n) && find(early, n)->metal && !find(early, n)->visible &&
+          find(early, n)->x == -32000 && find(early, n)->w == 0,
+          "swapchain before frame creates a zero-size/off-screen render entry");
+    winios_census_note_game_metal(child);
+    winios_census_note_game_metal(NULL);
+    CHECK(winios_window_census(out, WINIOS_CENSUS_MAX) == n, "child and null swapchains are excluded");
+    render_x = render_y = 0; render_w = 1280; render_h = 720;
+    winios_census_note_frame(early, 0, 0, 1280, 720, 1);
+    n = winios_window_census(out, WINIOS_CENSUS_MAX);
+    CHECK(find(early, n)->visible && find(early, n)->metal, "later valid frame preserves Metal evidence");
+    winios_census_forget(early);
 
     for (unsigned long i = 0; i < 80; i++) winios_census_note_frame(add(0x1000 + i, 0x84000000, 1, 0x44), 0, 0, 10, 10, 1);
     n = winios_window_census(out, WINIOS_CENSUS_MAX);

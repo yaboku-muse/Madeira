@@ -25,12 +25,49 @@ final class LogStore: ObservableObject {
     private var pendingUpdates: [(index: Int, count: Int, lastRaw: String, lastTimestamp: Date)] = []
     private var flushTimer: Timer?
     private var displaySuppressed = false
+    private var launchDiagnosticsActive = false
+    private var latestLaunchRejection: SteamLoaderRejection?
+    private var trackedLaunchLifetime: SteamLaunchLifetime?
+
+    var launchCreation: SteamExecutableCreation? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return trackedLaunchLifetime?.gameCreation
+    }
+
+    var launchLifetime: SteamLaunchLifetime? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return trackedLaunchLifetime
+    }
+
+    func trackLaunchExecutable(_ image: String?) {
+        stateLock.lock(); defer { stateLock.unlock() }
+        trackedLaunchLifetime = image.map { SteamLaunchLifetime(expectedGame: $0, expectedHost: MadeiraDock.executable) }
+    }
+
+    var launchRejection: SteamLoaderRejection? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return latestLaunchRejection
+    }
+
+    func resetLaunchRejection() {
+        stateLock.lock(); latestLaunchRejection = nil; stateLock.unlock()
+    }
+
+    func setLaunchDiagnosticsActive(_ active: Bool) {
+        stateLock.lock()
+        launchDiagnosticsActive = active
+        let pause = displaySuppressed && !active
+        stateLock.unlock()
+        tail?.setDisplayPaused(pause)
+    }
 
     func setDisplayActive(_ active: Bool) {
         let disabled = !MadeiraConfig.flag("MADEIRA_UI_LOG_IDLE")
         let suppress = !active && !disabled
-        stateLock.lock(); displaySuppressed = suppress; stateLock.unlock()
-        tail?.setDisplayPaused(suppress)
+        stateLock.lock(); displaySuppressed = suppress
+        let pause = suppress && !launchDiagnosticsActive
+        stateLock.unlock()
+        tail?.setDisplayPaused(pause)
         fputs("[ui-log-idle] display parsing suspended=\(suppress ? 1 : 0); file capture unchanged\n", stderr)
     }
 
@@ -174,6 +211,16 @@ final class LogStore: ObservableObject {
 
     /// Called from tail-file callback (background queue) or C callback.
     private func handleRawLine(_ raw: String) {
+        // Capture rare explicit loader failures even when the live log's display
+        // parsing is suspended. Do not retain paths or scan generic log noise.
+        if (raw.contains("[pe-image]") || raw.contains("[dll-missing]")), let rejection = SteamLoaderRejection.parse(raw) {
+            stateLock.lock(); latestLaunchRejection = rejection; stateLock.unlock()
+        }
+        if raw.hasPrefix("[process-created]") || raw.hasPrefix("[process-exited]") {
+            stateLock.lock()
+            trackedLaunchLifetime?.consume(raw)
+            stateLock.unlock()
+        }
         stateLock.lock(); let suppressed = displaySuppressed; stateLock.unlock()
         if suppressed { return }
         // Filter out lines we never want in UI (excessive byte spam, etc.)
@@ -318,6 +365,7 @@ final class LogStore: ObservableObject {
         sigToIndex.removeAll()
         pendingNew.removeAll()
         pendingUpdates.removeAll()
+        latestLaunchRejection = nil
         stateLock.unlock()
         entries.removeAll()
         try? "".write(to: logFileURL, atomically: true, encoding: .utf8)

@@ -1,0 +1,40 @@
+name: FEX WOW64 source rebuild
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wow64:
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v5
+      - name: Retrieve pinned Madeira FEX source
+        run: git submodule update --init --recursive --depth 1 FEX
+      - name: Fetch pinned Windows cross compiler
+        run: bash build/ci/fetch-mingw.sh
+      - name: Build 32-bit guest translator from source
+        run: bash build/fex-wow64/build.sh
+      - name: Record PE metadata and source revision
+        run: |
+          mkdir -p build/ci-output/fex-wow64
+          cp app/Madeira/aarch64-windows/xtajit.dll build/ci-output/fex-wow64/
+          python3 tools/inspect-pe-imports.py build/ci-output/fex-wow64/xtajit.dll > build/ci-output/fex-wow64/pe-metadata.json
+          git rev-parse HEAD > build/ci-output/fex-wow64/madeira-commit.txt
+          git submodule status --recursive FEX > build/ci-output/fex-wow64/fex-commits.txt
+          (cd build/ci-output/fex-wow64 && shasum -a 256 xtajit.dll > xtajit.dll.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WOW64-FEX-source-build
+          path: build/ci-output/fex-wow64
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: WOW64-FEX-build-errors
+          path: FEX/build-wow64/CMakeFiles/CMakeConfigureLog.yaml

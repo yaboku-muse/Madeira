@@ -83,7 +83,12 @@ import UserNotifications
         guard !observing else { return }
         observing = true
         NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.beginGrace() }
+            MainActor.assumeIsolated {
+                // Controls must stop immediately: background grace is reserved
+                // for installs and can be absent when no install is active.
+                self?.library?.cancelNativeControl()
+                self?.beginGrace()
+            }
         }
         NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {

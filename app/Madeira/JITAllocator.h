@@ -71,6 +71,10 @@ bool jit_task_map_range(uint64_t *min_address, uint64_t *max_address);
 // Memory this process may still allocate before the system's limit.
 uint64_t jit_available_memory(void);
 
+// Conservative Wine pool head frontier + reserved tail, and total capacity.
+// Neither value is live code size or physical footprint. Safe outside Wine.
+void ios_jit_pool_usage(uint64_t *reserved, uint64_t *capacity);
+
 // iOS 26 BRK-based protocol: Ask attached debugger (StikDebug) to
 // prepare a memory region for JIT execution.
 // Returns the prepared address (may differ from input on allocation).

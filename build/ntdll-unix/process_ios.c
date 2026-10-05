@@ -604,6 +604,7 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     char **argv;
     struct ios_child_args *args;
     pthread_t child_thread;
+    NTSTATUS status;
     int ret, argc;
 
     argv = build_argv( &params->CommandLine, 2 );
@@ -619,13 +620,17 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     args = calloc( 1, sizeof(*args) );
     if (!args) { free( argv ); return STATUS_NO_MEMORY; }
 
-    /* dup the socketfd — parent will close the original after we return */
-    args->socketfd = dup( socketfd );
-    /* dup the unixdir — parent will also close the original (iOS shares fd table) */
-    args->unixdir = (unixdir != -1) ? dup( unixdir ) : -1;
+    args->socketfd = args->unixdir = args->slot = -1;
     args->argv = argv;
     args->argc = argc;
     args->pe_info = *pe_info;
+
+    /* dup the socketfd — parent will close the original after we return */
+    args->socketfd = dup( socketfd );
+    if (args->socketfd == -1) { status = errno_to_status( errno ); goto failed; }
+    /* dup the unixdir — parent will also close the original (iOS shares fd table) */
+    args->unixdir = (unixdir != -1) ? dup( unixdir ) : -1;
+    if (unixdir != -1 && args->unixdir == -1) { status = errno_to_status( errno ); goto failed; }
     args->slot = ios_child_slot_take( &params->ImagePathName );
 
     if (winedebug) putenv( winedebug );
@@ -636,14 +641,20 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     ret = pthread_create( &child_thread, NULL, ios_child_thread_entry, args );
     if (ret) {
         ERR("spawn_process: pthread_create failed: %d\n", ret);
-        ios_child_slot_release( args->slot );
-        free( argv );
-        free( args );
-        return STATUS_NO_MEMORY;
+        status = STATUS_NO_MEMORY;
+        goto failed;
     }
     pthread_detach( child_thread );
 
     return STATUS_SUCCESS;
+failed:
+    /* No child owns these yet. Never close the parent's original descriptors. */
+    if (args->socketfd != -1) close( args->socketfd );
+    if (args->unixdir != -1) close( args->unixdir );
+    ios_child_slot_release( args->slot );
+    free( argv );
+    free( args );
+    return status;
 #else
     NTSTATUS status = STATUS_SUCCESS;
     int stdin_fd = -1, stdout_fd = -1;
@@ -1045,6 +1056,69 @@ static void madeira_steam_session_log( const UNICODE_STRING *image )
 }
 #endif
 
+#ifdef WINE_IOS
+/* Counted UTF-16 hex avoids ambiguous debug-string escaping in machine-readable
+ * process evidence. This is a private diagnostic path, never a command line. */
+static void ios_log_process_created( const UNICODE_STRING *image, unsigned pid, unsigned tid )
+{
+    extern unsigned long long ios_process_generation_for_pid( unsigned pid );
+    extern void wine_ui_log( const char *message ) __attribute__((weak));
+    static const char hex[] = "0123456789abcdef";
+    char encoded[512 * 4 + 1];
+    char record[2304];
+    unsigned i, length;
+
+    if (!image || !image->Buffer || !pid || !tid || image->Length % sizeof(WCHAR)) return;
+    length = image->Length / sizeof(WCHAR);
+    if (!length || length > 512) return;
+    for (i = 0; i < length; i++)
+    {
+        unsigned c = image->Buffer[i];
+        encoded[i * 4] = hex[(c >> 12) & 15];
+        encoded[i * 4 + 1] = hex[(c >> 8) & 15];
+        encoded[i * 4 + 2] = hex[(c >> 4) & 15];
+        encoded[i * 4 + 3] = hex[c & 15];
+    }
+    encoded[length * 4] = 0;
+    snprintf( record, sizeof(record), "[process-created] pid=%08x tid=%08x status=00000000 generation=%016llx image_utf16=%s",
+             pid, tid, ios_process_generation_for_pid( pid ), encoded );
+    dprintf( 2, "%s\n", record );
+    if (wine_ui_log) wine_ui_log( record );
+}
+
+/* Optional helper containment applies to an executable basename, never to a
+ * directory or an arbitrary substring in a game's path. Counted UTF-16 input
+ * need not be NUL terminated. Keep the existing refusal result for these helpers. */
+static const char *ios_optional_helper_gate( const WCHAR *image, unsigned length )
+{
+    static const char *const names[] = {
+        "steamerrorreporter.exe", "steamerrorreporter64.exe",
+        "gldriverquery.exe", "gldriverquery64.exe",
+        "vulkandriverquery.exe", "vulkandriverquery64.exe",
+        "steamsysinfo.exe", "steamsysinfo64.exe",
+        "hardwareupdater.exe", "unitycrashhandler64.exe"
+    };
+    unsigned start = 0, i, j;
+    if (!image || !length) return NULL;
+    if (length >= 2 && image[1] == ':' &&
+        ((image[0] >= 'A' && image[0] <= 'Z') || (image[0] >= 'a' && image[0] <= 'z'))) start = 2;
+    for (i = start; i < length; i++) if (image[i] == '\\' || image[i] == '/') start = i + 1;
+    for (i = 0; i < ARRAY_SIZE(names); i++)
+    {
+        unsigned n = strlen( names[i] );
+        if (length - start != n) continue;
+        for (j = 0; j < n; j++)
+        {
+            WCHAR c = image[start + j];
+            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+            if (c != (WCHAR)names[i][j]) break;
+        }
+        if (j == n) return names[i];
+    }
+    return NULL;
+}
+#endif
+
 /**********************************************************************
  *           NtCreateUserProcess  (NTDLL.@)
  */
@@ -1193,33 +1267,13 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
          * "EnterEC wrote it" does NOT name the origin — Core.cpp says so explicitly:
          * EnterEC storing an x64 target in State.rip is its job. The upstream producer
          * still needs finding via x9 at DispatchJump/RetToEntryThunk/ExitToX64. */
-        static const char * const blocked_names[] = { "steamerrorreporter", "gldriverquery", "vulkandriverquery",
-                                                      "steamsysinfo", "hardwareupdater",
-                                                      "unitycrashhandler64" };
-        const WCHAR *ip = params->ImagePathName.Buffer;
-        int ip_len = params->ImagePathName.Length / sizeof(WCHAR);
-        unsigned b;
-
-        for (b = 0; b < sizeof(blocked_names)/sizeof(blocked_names[0]); b++)
+        const char *blocked = ios_optional_helper_gate( params->ImagePathName.Buffer,
+                                                       params->ImagePathName.Length / sizeof(WCHAR) );
+        if (blocked)
         {
-            const char *blocked = blocked_names[b];
-            int bl = (int)strlen( blocked ), k, j;
-
-            for (k = 0; k + bl <= ip_len; k++)
-            {
-                for (j = 0; j < bl; j++)
-                {
-                    WCHAR c = ip[k + j];
-                    if (c >= 'A' && c <= 'Z') c += 32;
-                    if (c != (WCHAR)blocked[j]) break;
-                }
-                if (j == bl)
-                {
-                    dprintf(2, "[proc-gate] REFUSING spawn of %s (%s gate)\n",
-                            debugstr_us( &params->ImagePathName ), blocked );
-                    return STATUS_ACCESS_DENIED;
-                }
-            }
+            dprintf(2, "[proc-gate] REFUSING spawn of %s (%s gate)\n",
+                    debugstr_us( &params->ImagePathName ), blocked );
+            return STATUS_ACCESS_DENIED;
         }
     }
 
@@ -1723,13 +1777,15 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
 
     /* wait for the new process info to be ready */
 
-    NtWaitForSingleObject( process_info, FALSE, NULL );
+    if ((status = NtWaitForSingleObject( process_info, FALSE, NULL ))) goto done;
     SERVER_START_REQ( get_new_process_info )
     {
         req->info = wine_server_obj_handle( process_info );
-        wine_server_call( req );
-        success = reply->success;
-        status = reply->exit_code;
+        if (!(status = wine_server_call( req )))
+        {
+            success = reply->success;
+            status = reply->exit_code;
+        }
     }
     SERVER_END_REQ;
 
@@ -1742,6 +1798,12 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     TRACE( "%s pid %04x tid %04x handles %p/%p\n", debugstr_us(&path),
            HandleToULong(id.UniqueProcess), HandleToULong(id.UniqueThread),
            process_handle, thread_handle );
+
+#ifdef WINE_IOS
+    /* Only the server-confirmed successful creation is evidence. A spawn
+     * request or a thread/census slot reservation is not a created process. */
+    ios_log_process_created( &path, HandleToULong(id.UniqueProcess), HandleToULong(id.UniqueThread) );
+#endif
 
     /* update output attributes */
 

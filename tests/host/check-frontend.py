@@ -444,9 +444,12 @@ with tempfile.TemporaryDirectory() as tmp:
             failures.append('C harness')
 
 wrapper = block(server, 'void process_exit_wrapper( int status )')
-initial = wrapper[wrapper.index('    else\n    {'):]
+session_branch = '    else if (ios_session_socket_owner())\n    {'
+initial = wrapper[wrapper.index(session_branch):]
 check('wine_launched_process_did_exit( status );' in initial and wrapper.count('wine_launched_process_did_exit( status );') == 1,
-      'ntdll reports only the initial (app-launched) process exit, from the no-slot branch')
+      'ntdll reports only the initial (app-launched) process exit, from the explicit session-owner branch')
+check('wine_launched_process_did_exit' not in wrapper[:wrapper.index(session_branch)],
+      'registered and unknown non-session children never use the initial-process exit hook')
 check('__attribute__((weak))' in initial and 'ImagePathName' not in server and 'wine_process_did_' not in server,
       'the hook is weak and gets no image name')
 check('madeira_exit_is_helper' not in bridge and '.exe"' not in bridge[bridge.index('static uint64_t g_launch_exit'):bridge.index('static char *g_prefix_path')],

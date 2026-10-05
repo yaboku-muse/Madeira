@@ -195,6 +195,17 @@ for s in air_msad air_samplepos air_tessellation; do
 done
 
 echo "=== airconv (C++ 20, needs LLVM headers) ==="
+# Match src/airconv/meson.build: these are AIR bitcode arrays linked by
+# airconv_context.cpp, not metallib containers. Generate them on clean builds
+# before compiling their consumer, using the pinned source's language/target.
+mkdir -p "$BUILD_DIR/shader-headers"
+for shader in air_msad air_samplepos air_tessellation; do
+    xcrun -sdk macosx metal -std=metal3.1 --target=air64-apple-macos14.0 \
+        -o "$BUILD_DIR/shader-headers/$shader.air" -c "$DXMT_SRC/airconv/shaders/$shader.metal"
+    xxd -n "$shader" -i "$BUILD_DIR/shader-headers/$shader.air" \
+        "$BUILD_DIR/shader-headers/$shader.h"
+    echo "  $shader.h generated from pinned Metal source"
+done
 for cpp in airconv_context.cpp air_type.cpp air_signature.cpp air_operations.cpp \
            dxbc_converter.cpp dxbc_converter_gs.cpp dxbc_converter_ts.cpp \
            dxbc_converter_basicblock.cpp dxbc_converter_cfg.cpp \
@@ -328,18 +339,12 @@ echo "=== Archiving libdxmt_unix.a ==="
 xcrun -sdk iphoneos ar rcs "$OUT_LIB" "$OBJ_DIR"/*.o
 echo "Built: $OUT_LIB ($(wc -c < "$OUT_LIB" | tr -d ' ') bytes)"
 
-# The app links libdxmt_combined.a (this unix side merged with the LLVM archives
-# airconv needs), NOT libdxmt_unix.a. Refreshing only the latter is how a change
-# here reaches nothing: the app would keep linking the previous objects and the
-# build would look clean. Replace our members in place and re-index.
+# Build the archive the app actually links, including on a clean checkout.
+# Recreate it so removed objects and old LLVM members cannot survive a rebuild.
 COMBINED="$BUILD_DIR/libdxmt_combined.a"
-if [ -f "$COMBINED" ]; then
-    echo "=== Refreshing libdxmt_combined.a ==="
-    xcrun -sdk iphoneos ar r "$COMBINED" "$OBJ_DIR"/*.o
-    xcrun -sdk iphoneos ranlib "$COMBINED"
-    echo "Refreshed: $COMBINED ($(wc -c < "$COMBINED" | tr -d ' ') bytes)"
-    APP_COPY="$REPO_ROOT/app/Madeira/libdxmt_combined.a"
-    if [ -f "$APP_COPY" ]; then cp "$COMBINED" "$APP_COPY"; echo "Staged: $APP_COPY"; fi
-else
-    echo "NOTE: $COMBINED absent; the app links that file, so build it before deploying."
-fi
+[ -f "$LLVM_BUILD/lib/libLLVMCore.a" ] || { echo "Missing iOS LLVM archives: run build/llvm-ios/build.sh" >&2; exit 1; }
+echo "=== Combining DXMT and LLVM iOS archives ==="
+xcrun -sdk iphoneos libtool -static -o "$COMBINED.tmp" "$OBJ_DIR"/*.o "$LLVM_BUILD/lib/"*.a
+mv "$COMBINED.tmp" "$COMBINED"
+cp "$COMBINED" "$REPO_ROOT/app/Madeira/libdxmt_combined.a"
+echo "Staged: app/Madeira/libdxmt_combined.a ($(wc -c < "$COMBINED" | tr -d ' ') bytes)"

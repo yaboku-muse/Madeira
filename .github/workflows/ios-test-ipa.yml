@@ -1,0 +1,209 @@
+name: iOS diagnostic test IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      reuse_llvm_run:
+        description: Earlier successful LLVM artifact run ID (optional)
+        type: string
+        default: ''
+      reuse_runtime_run:
+        description: Earlier successful native runtime artifact run ID (optional)
+        type: string
+        default: ''
+      reuse_fex_run:
+        description: Earlier successful FEX artifact run ID (optional)
+        type: string
+        default: ''
+      dxmt_source_run:
+        description: Successful DXMT ARM64EC source build run with matching Wine/DXMT pins (optional)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+
+jobs:
+  llvm-ios:
+    if: inputs.reuse_llvm_run == ''
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build pinned iOS LLVM
+        run: bash build/llvm-ios/build.sh
+      - name: Pack LLVM libraries and headers
+        run: |
+          tar -czf llvm-ios.tar.gz toolchains/llvm-ios-build/lib/*.a toolchains/llvm-ios-build/include toolchains/llvm-project/llvm/include
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llvm-ios
+          path: llvm-ios.tar.gz
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: llvm-build-errors
+          path: toolchains/**/CMakeFiles/CMakeConfigureLog.yaml
+
+  fex-ios:
+    if: inputs.reuse_fex_run == ''
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - name: Retrieve pinned Madeira FEX and nested dependencies
+        run: git submodule update --init --recursive --depth 1 FEX
+      - name: Build native iOS FEX
+        run: bash build/fex-ios/build.sh
+      - name: Pack native FEX libraries and generated headers
+        run: |
+          test -s FEX/build-ios/include/FEXCore/Config/ConfigValues.inl
+          test -s FEX/build-ios/include/FEXCore/Config/ConfigOptions.inl
+          find FEX/build-ios -type f \( -name '*.a' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.inl' \) > fex-files.txt
+          tar -czf fex-ios.tar.gz -T fex-files.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fex-ios
+          path: fex-ios.tar.gz
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fex-build-errors
+          path: FEX/build-ios/CMakeFiles/CMakeConfigureLog.yaml
+
+  native-runtime:
+    if: inputs.reuse_runtime_run == ''
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - name: Retrieve changed Madeira Wine and Dock forks
+        run: git submodule update --init --depth 1 wine madeira-dock
+      - name: Install build utilities
+        run: brew install bison autoconf automake libtool
+      - name: Build Wine, Dock and native dependencies
+        run: bash build/ci/native-runtime.sh
+      - name: Pack runtime outputs
+        run: |
+          tar -czf native-runtime.tar.gz app/Madeira/lib*.a app/Madeira/arm64ec-windows/ntdll.dll app/Madeira/arm64ec-windows/dockhost.exe app/Madeira/arm64ec-windows/dock-notices.txt app/Madeira/legal/LICENSES-rppairing-crates.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-runtime
+          path: native-runtime.tar.gz
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: runtime-build-errors
+          path: |
+            build/**/obj/*.err
+            build/**/obj/err-*.txt
+            build/**/obj/*.log
+            build/**/config.log
+            wine/build-*/config.log
+
+  app:
+    needs: [llvm-ios, fex-ios, native-runtime]
+    if: >-
+      always() &&
+      (needs.llvm-ios.result == 'success' || inputs.reuse_llvm_run != '') &&
+      (needs.fex-ios.result == 'success' || inputs.reuse_fex_run != '') &&
+      (needs.native-runtime.result == 'success' || inputs.reuse_runtime_run != '')
+    runs-on: macos-26
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+      - name: Retrieve pinned FEX and DXMT headers and sources
+        run: git submodule update --init --recursive --depth 1 FEX dxmt wine madeira-dock
+      - name: Wait for explicitly reused component artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LLVM_RUN: ${{ inputs.reuse_llvm_run }}
+          RUNTIME_RUN: ${{ inputs.reuse_runtime_run }}
+          FEX_RUN: ${{ inputs.reuse_fex_run }}
+        run: |
+          bash build/ci/wait-artifacts.sh
+      - uses: actions/download-artifact@v4
+        with:
+          name: llvm-ios
+          run-id: ${{ inputs.reuse_llvm_run || github.run_id }}
+          github-token: ${{ github.token }}
+          path: build/ci-artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: fex-ios
+          run-id: ${{ inputs.reuse_fex_run || github.run_id }}
+          github-token: ${{ github.token }}
+          path: build/ci-artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-runtime
+          run-id: ${{ inputs.reuse_runtime_run || github.run_id }}
+          github-token: ${{ github.token }}
+          path: build/ci-artifacts
+      - name: Restore built dependencies
+        run: |
+          for archive in build/ci-artifacts/*.tar.gz; do tar -xzf "$archive"; done
+          test -s FEX/build-ios/include/FEXCore/Config/ConfigValues.inl
+          test -s FEX/build-ios/include/FEXCore/Config/ConfigOptions.inl
+      - name: Build DXMT Metal side
+        run: |
+          xcodebuild -downloadComponent MetalToolchain
+          bash build/dxmt-ios/build.sh
+      - name: Require a successful graphics source workflow
+        if: inputs.dxmt_source_run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DXMT_SOURCE_RUN: ${{ inputs.dxmt_source_run }}
+        run: |
+          [[ "$DXMT_SOURCE_RUN" =~ ^[0-9]+$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$DXMT_SOURCE_RUN" > build/ci-artifacts/dxmt-run.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          run = json.loads(Path('build/ci-artifacts/dxmt-run.json').read_text())
+          assert run['status'] == 'completed' and run['conclusion'] == 'success', 'graphics run has not passed'
+          assert run['path'] == '.github/workflows/dxmt-arm64ec-build.yml', 'unexpected graphics workflow'
+          PY
+      - uses: actions/download-artifact@v4
+        if: inputs.dxmt_source_run != ''
+        with:
+          name: DXMT-ARM64EC-source-build
+          run-id: ${{ inputs.dxmt_source_run }}
+          github-token: ${{ github.token }}
+          path: build/ci-artifacts/dxmt-source
+      - name: Verify and stage source-built DXMT graphics DLLs
+        if: inputs.dxmt_source_run != ''
+        env:
+          DXMT_SOURCE_RUN: ${{ inputs.dxmt_source_run }}
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          run = json.loads(Path('build/ci-artifacts/dxmt-run.json').read_text())
+          commit = Path('build/ci-artifacts/dxmt-source/madeira-commit.txt').read_text().strip()
+          assert commit == run['head_sha'], 'artifact source does not match authenticated run'
+          PY
+          python3 tools/stage-dxmt-artifact.py build/ci-artifacts/dxmt-source --run-id "$DXMT_SOURCE_RUN"
+      - name: Build and package diagnostic IPA
+        run: bash build/ci/package-ipa.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-diagnostic-IPA
+          path: |
+            build/ci-output/*.ipa
+            build/ci-output/*.json
+            build/ci-output/*.sha256
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: app-build-errors
+          path: |
+            build/dxmt-ios/obj/*.err
+            build/ci-output/xcodebuild.log
