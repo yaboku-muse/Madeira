@@ -22,6 +22,7 @@ xcodebuild -project "$R/app/Madeira.xcodeproj" -scheme Madeira \
     -configuration Debug -destination 'generic/platform=iOS' \
     -derivedDataPath "$R/build/xcode-derived" \
     CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY= DEVELOPMENT_TEAM= \
+    MADEIRA_BUNDLE_IDENTIFIER=com.willfaust.madeora \
     CURRENT_PROJECT_VERSION=100 build 2>&1 | tee "$OUT/xcodebuild.log"
 APP="$R/build/xcode-derived/Build/Products/Debug-iphoneos/Madeira.app"
 test -f "$APP/Madeira"
