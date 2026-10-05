@@ -478,11 +478,21 @@ static BOOL ios_register_proc_socket(void *peb_id, int fd)
     unsigned bucket = ios_proc_socket_bucket( peb_id );
     if (!peb_id || fd < 0 || !(entry = calloc( 1, sizeof(*entry) ))) return FALSE;
     ios_fdt_reg( fd, FDT_MASTER, peb_id );
-    ios_proc_sockets[idx].fd = fd;
-    ios_proc_sockets[idx].exiting = FALSE;
+    entry->peb = peb_id;
+    entry->fd = fd;
+    entry->exiting = FALSE;
     ios_forget_dead_peb( peb_id );
-    __sync_synchronize();
-    ios_proc_sockets[idx].peb = peb_id;
+    pthread_mutex_lock( &ios_proc_socket_lock );
+    entry->generation = ++ios_proc_generation;
+    entry->next = ios_proc_sockets[bucket];
+    ios_proc_sockets[bucket] = entry;
+    pthread_mutex_unlock( &ios_proc_socket_lock );
+    if (peb_id == ios_jit_current_peb())
+    {
+        ios_thread_proc_socket = entry;
+        ios_exit_status_known = FALSE;
+    }
+    return TRUE;
 }
 #endif
 static _Thread_local int initial_cwd = -1;
@@ -3776,9 +3786,12 @@ void process_exit_wrapper( int status )
          * NtUnmapViewOfSection needs a live server connection, and this is the
          * last moment we have one while still on the owning process's thread. */
         ios_retire_own_fixed_base_image( dead_peb );
-        ios_fdt_note_close( ios_proc_sockets[i].fd, "exit-master", dead_peb );
-        close( ios_proc_sockets[i].fd );
-        ios_proc_sockets[i].peb = NULL;
+        owned_fd = ios_take_proc_socket( entry );
+        if (owned_fd >= 0)
+        {
+            ios_fdt_note_close( owned_fd, "exit-master", dead_peb );
+            close( owned_fd );
+        }
         ios_dead_pebs[__sync_fetch_and_add( &ios_dead_peb_next, 1 ) % IOS_DEAD_PEBS] = dead_peb;
         /* ml571: drop this pseudo-process's fd cache and close what it held.
          * Must happen on the SAME identity used to key it, and before the JIT

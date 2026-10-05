@@ -1859,30 +1859,6 @@ static int ios_mach_emulate_store( uint32_t insn, uintptr_t fault_addr,
     return 1;
 }
 
-/* LSE atomic memory operations through an existing writable alias. A genuine
- * atomic RMW is required: other guest/native threads can access the same page
- * while the Mach exception thread runs. Sequential consistency is stronger
- * than every encoded acquire/release variant. No allocation or Wine calls. */
-static uint64_t ios_mach_lse_result(unsigned op, unsigned width, uint64_t old, uint64_t src)
-{
-    uint64_t mask = width == 8 ? UINT64_MAX : (1ULL << (width * 8)) - 1;
-    uint64_t sign = 1ULL << (width * 8 - 1);
-    old &= mask;
-    src &= mask;
-    switch (op)
-    {
-    case 0: return (old + src) & mask;                       /* LDADD */
-    case 1: return old & ~src;                              /* LDCLR */
-    case 2: return old ^ src;                               /* LDEOR */
-    case 3: return old | src;                               /* LDSET */
-    case 4: return (old ^ sign) >= (src ^ sign) ? old : src;  /* LDSMAX */
-    case 5: return (old ^ sign) <= (src ^ sign) ? old : src;  /* LDSMIN */
-    case 6: return old >= src ? old : src;                   /* LDUMAX */
-    case 7: return old <= src ? old : src;                   /* LDUMIN */
-    default: return src;                                   /* SWP */
-    }
-}
-
 static int ios_mach_emulate_lse(uint32_t insn, uintptr_t rw_addr, uint64_t src, uint64_t *old)
 {
     unsigned width = 1u << (insn >> 30), op = (insn >> 12) & 15;
