@@ -11,6 +11,12 @@ extern "C" {
 // Returns 0 on success, -1 on error.
 int wine_process_start(const char *prefix_path);
 
+// iOS audio route management (ported from dre4moff r25). Prepares the
+// AVAudioSession (playback, or play-and-record when the microphone is
+// enabled) and snapshots the current input/output routes.
+void madeira_audio_prepare(void);
+void madeira_audio_refresh_routes(void);
+
 // Check if Wine process is running
 int wine_process_is_running(void);
 
