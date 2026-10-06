@@ -146,7 +146,24 @@
 		B1000786 /* EpicInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000786 /* EpicInstaller.swift */; };
 		A1000410 /* CacheMaintenance.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000410 /* CacheMaintenance.swift */; };
 		A1000411 /* PerformanceDiagnostics.m in Sources */ = {isa = PBXBuildFile; fileRef = A2000411 /* PerformanceDiagnostics.m */; };
+		B1000002 /* JITBuiltInHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000002 /* JITBuiltInHost.swift */; };
+		B1000003 /* JITBuiltInMessages.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000003 /* JITBuiltInMessages.swift */; };
+		B1000040 /* JITPairing.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000040 /* JITPairing.swift */; };
+		B1000041 /* libmadeira_rppairing.a in Frameworks */ = {isa = PBXBuildFile; fileRef = B2000041 /* libmadeira_rppairing.a */; };
+		B1000005 /* ExtensionFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B2000010 /* ExtensionFoundation.framework */; settings = {ATTRIBUTES = (Weak, ); }; };
+		B1000010 /* MadeiraJITHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000020 /* MadeiraJITHelper.swift */; };
+		B1000011 /* JITBuiltInMessages.swift in Helper Sources */ = {isa = PBXBuildFile; fileRef = B2000003 /* JITBuiltInMessages.swift */; };
+		B1000014 /* ExtensionFoundation.framework in Helper Frameworks */ = {isa = PBXBuildFile; fileRef = B2000010 /* ExtensionFoundation.framework */; };
+		B1000016 /* MadeiraJITHelper.appex in Embed JIT Helper */ = {isa = PBXBuildFile; fileRef = B2000022 /* MadeiraJITHelper.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
+/* Begin PBXCopyFilesBuildPhase section */
+		B3000002 /* Embed Frameworks */ = {
+		B3000003 /* Embed JIT Helper */ = {
+/* End PBXCopyFilesBuildPhase section */
+/* Begin PBXContainerItemProxy section */
+		B3000001 /* PBXContainerItemProxy */ = {
+			remoteGlobalIDString = B5000001;
+/* End PBXContainerItemProxy section */
 
 
 
@@ -304,6 +321,9 @@
 		B2000786 /* EpicInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Epic/EpicInstaller.swift; sourceTree = "<group>"; };
 		A2000410 /* CacheMaintenance.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheMaintenance.swift; sourceTree = "<group>"; };
 		A2000411 /* PerformanceDiagnostics.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = PerformanceDiagnostics.m; sourceTree = "<group>"; };
+		B2000042 /* MadeiraRPPairing.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MadeiraRPPairing.h; sourceTree = "<group>"; };
+		B2000021 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B2000030 /* StikJIT.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = Frameworks/StikJIT.xcframework; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -349,6 +369,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B3000004 /* Frameworks */ = {
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -535,6 +556,7 @@
 			name = Libraries;
 			sourceTree = "<group>";
 		};
+				B4000001 /* MadeiraJITHelper */,
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -556,6 +578,27 @@
 			productName = Madeira;
 			productReference = A2000009 /* Madeira.app */;
 			productType = "com.apple.product-type.application";
+		};
+				B3000006 /* PBXTargetDependency */,
+			buildConfigurationList = B7000001 /* Build configuration list for PBXNativeTarget "MadeiraJITHelper" */;
+				B3000005 /* Sources */,
+		B5000001 /* MadeiraJITHelper */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B7000001 /* Build configuration list for PBXNativeTarget "MadeiraJITHelper" */;
+			buildPhases = (
+				B3000005 /* Sources */,
+				B3000004 /* Frameworks */,
+				B3000002 /* Embed Frameworks */,
+				B3000007 /* Embed StikJIT */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = MadeiraJITHelper;
+			productName = MadeiraJITHelper;
+			productReference = B2000022 /* MadeiraJITHelper.appex */;
+			productType = "com.apple.product-type.extensionkit-extension";
 		};
 /* End PBXNativeTarget section */
 
@@ -899,6 +942,8 @@
 			};
 			name = Release;
 		};
+		B8000001 /* Debug */ = {
+		B8000002 /* Release */ = {
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
