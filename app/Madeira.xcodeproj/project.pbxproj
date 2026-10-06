@@ -10,6 +10,10 @@
 		A1000520 /* MadeiraDock.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000520 /* MadeiraDock.swift */; };
 		A1000521 /* MadeiraDockView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000521 /* MadeiraDockView.swift */; };
 		A1000650 /* DockStartScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000650 /* DockStartScreen.swift */; };
+		A1000651 /* UbisoftAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000651 /* UbisoftAuth.swift */; };
+		A1000652 /* UbisoftDock.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000652 /* UbisoftDock.swift */; };
+		A1000653 /* UbisoftGames.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000653 /* UbisoftGames.swift */; };
+		A1000654 /* UbisoftLoginView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000654 /* UbisoftLoginView.swift */; };
 		A1000530 /* Onboarding.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000530 /* Onboarding.swift */; };
 		A1000540 /* ConfigCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000540 /* ConfigCatalog.swift */; };
 		A1000541 /* ConfigCatalog.generated.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000541 /* ConfigCatalog.generated.swift */; };
@@ -150,6 +154,10 @@
 		A2000520 /* MadeiraDock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MadeiraDock.swift"; sourceTree = "<group>"; };
 		A2000521 /* MadeiraDockView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MadeiraDockView.swift"; sourceTree = "<group>"; };
 		A2000650 /* DockStartScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DockStartScreen.swift"; sourceTree = "<group>"; };
+		A2000651 /* UbisoftAuth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "UbisoftAuth.swift"; sourceTree = "<group>"; };
+		A2000652 /* UbisoftDock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "UbisoftDock.swift"; sourceTree = "<group>"; };
+		A2000653 /* UbisoftGames.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "UbisoftGames.swift"; sourceTree = "<group>"; };
+		A2000654 /* UbisoftLoginView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "UbisoftLoginView.swift"; sourceTree = "<group>"; };
 		A2000530 /* Onboarding.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Onboarding.swift"; sourceTree = "<group>"; };
 		A2000540 /* ConfigCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ConfigCatalog.swift"; sourceTree = "<group>"; };
 		A2000541 /* ConfigCatalog.generated.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ConfigCatalog.generated.swift"; sourceTree = "<group>"; };
@@ -359,6 +367,10 @@
 				A2000520 /* MadeiraDock.swift */,
 				A2000521 /* MadeiraDockView.swift */,
 				A2000650 /* DockStartScreen.swift */,
+				A2000651 /* UbisoftAuth.swift */,
+				A2000652 /* UbisoftDock.swift */,
+				A2000653 /* UbisoftGames.swift */,
+				A2000654 /* UbisoftLoginView.swift */,
 				A2000530 /* Onboarding.swift */,
 				A2000540 /* ConfigCatalog.swift */,
 				A2000541 /* ConfigCatalog.generated.swift */,
@@ -628,6 +640,10 @@
 				A1000520 /* MadeiraDock.swift in Sources */,
 				A1000521 /* MadeiraDockView.swift in Sources */,
 				A1000650 /* DockStartScreen.swift in Sources */,
+				A1000651 /* UbisoftAuth.swift in Sources */,
+				A1000652 /* UbisoftDock.swift in Sources */,
+				A1000653 /* UbisoftGames.swift in Sources */,
+				A1000654 /* UbisoftLoginView.swift in Sources */,
 				A1000530 /* Onboarding.swift in Sources */,
 				A1000540 /* ConfigCatalog.swift in Sources */,
 				A1000541 /* ConfigCatalog.generated.swift in Sources */,
