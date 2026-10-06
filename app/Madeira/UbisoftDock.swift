@@ -114,30 +114,76 @@ final class UbisoftDock {
 
     // MARK: - Launch configuration
 
-    /// The host's environment for one launch.
-    static func configure(_ game: UbisoftDockGame) {
-        setenv("MADEIRA_UBI_HOST_LAUNCH", "1", 1)
-        setenv("MADEIRA_UBI_HOST_GAME_ID", game.id, 1)
-        setenv("MADEIRA_UBI_HOST_LAUNCH_MODE", game.launchMode == 1 ? "1" : "0", 1)
-        // Default Connect install location; the host falls back to this too.
+    /// The host's environment for the prepare phase. Call before the Steam
+    /// Dock launch for Ubisoft games: this gets Connect running so the
+    /// game's uplay_r1.dll DRM check passes when Steam starts the exe.
+    static func configurePrepare() {
+        setenv("MADEIRA_UBI_HOST_PREPARE", "1", 1)
         setenv("MADEIRA_UBI_HOST_CLIENT_DIR",
                "C:\\Program Files (x86)\\Ubisoft\\Ubisoft Game Launcher", 1)
         setenv("MADEIRA_UBI_HOST_LOG", "C:\\madeira-dock-ubi.txt", 1)
-        // Mark this as a Dock session (QoS policy, JIT pool sizing in ntdll-unix).
         setenv("MADEIRA_DOCK_SESSION", "1", 1)
     }
 
-    /// The Wine command that starts the Ubisoft host.
-    static var hostCommand: (exe: String, args: String) {
+    /// The Wine command that starts the Ubisoft prepare host.
+    /// Run this first; on probe-result=0 proceed with the Steam Dock launch.
+    static var prepareCommand: (exe: String, args: String) {
         ("explorer.exe", "/desktop=madeira,1280x720 C:\\windows\\system32\\dockhost-ubi.exe")
+    }
+
+    // MARK: - Ubisoft game detection
+
+    /// Known Ubisoft Steam app IDs (from the user's library; extend as found).
+    /// These need Connect running even though Steam owns the license.
+    static let knownUbisoftAppIDs: Set<Int> = [
+        359550,  // Rainbow Six Siege
+        323470,  // Ghost Recon Wildlands
+        552520,  // Far Cry 5
+        2379390, // R6 Siege Test Server
+        812140,  // Assassin's Creed Odyssey
+        911400,  // Assassin's Creed III Remastered
+        326949,  // The Division PTS
+        2146560, // The Outlast Trials
+        220240,  // Far Cry 3
+        304390,  // For Honor
+        365590,  // The Division
+    ]
+
+    /// Heuristic: a Steam game needs Ubisoft Connect if its install dir
+    /// contains uplay_r1.dll (the game-facing Ubisoft API) or its app ID is
+    /// in the known list.
+    static func needsUbisoftConnect(appID: Int, installPath: String) -> Bool {
+        if knownUbisoftAppIDs.contains(appID) { return true }
+        let fm = FileManager.default
+        // Check the top level and one deep for the Ubisoft runtime DLL.
+        let candidates = ["uplay_r1.dll", "uplay_r1_loader.dll", "uplay_r2.dll"]
+        for dll in candidates {
+            if fm.fileExists(atPath: (installPath as NSString).appendingPathComponent(dll)) {
+                return true
+            }
+        }
+        // One level deep (some games nest it in bin/).
+        if let children = try? fm.contentsOfDirectory(atPath: installPath) {
+            for child in children {
+                let sub = (installPath as NSString).appendingPathComponent(child)
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: sub, isDirectory: &isDir), isDir.boolValue else { continue }
+                for dll in candidates {
+                    if fm.fileExists(atPath: (sub as NSString).appendingPathComponent(dll)) {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
     }
 
     // MARK: - Report polling
 
     /// Allowed report field names (mirrors the host's ubi_report calls).
     private static let allowed: Set<String> = [
-        "host-start", "auth-consumed", "client-ensure", "client-running",
-        "url-fire", "url-fired", "launch-result", "probe-result",
+        "host-start", "auth-consumed", "client-already-running",
+        "client-starting", "client-running", "prepare-result", "probe-result",
     ]
 
     /// Reads new report fields. Call on the main actor, e.g. on a timer.
@@ -162,12 +208,11 @@ final class UbisoftDock {
     /// User-facing message for a terminal probe-result code.
     static func failureMessage(for code: Int) -> String {
         switch code {
-        case 0: return "Launched."
+        case 0: return "Ubisoft Connect is ready."
         case 30: return "Ubisoft Connect was not found. Install it via the Desktop session first."
         case 31: return "Could not start Ubisoft Connect."
-        case 32: return "Could not open the Ubisoft game link. Is Connect installed in the same prefix?"
-        case 33: return "Missing Ubisoft game ID."
-        default: return "Ubisoft Dock failed (code \(code))."
+        case 32: return "Ubisoft Connect did not start in time. Try launching it from the Desktop session once."
+        default: return "Ubisoft Connect prepare failed (code \(code))."
         }
     }
 }

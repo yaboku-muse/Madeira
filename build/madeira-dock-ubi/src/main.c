@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Madeira Converter Exception: see LICENSE-EXCEPTION.md
 //
-// dockhost-ubi.exe entry point.
+// dockhost-ubi.exe entry point: Ubisoft Connect prerequisite for the Dock.
+//
+// Steam-bought Ubisoft games launch through the normal Steam Dock; the
+// game's uplay_r1.dll needs the real Connect client (upc.exe) running and
+// logged in for its DRM check. This host ensures that client is up, then
+// exits 0 so the Steam launch can proceed.
 //
 // Env vars (MADEIRA_UBI_HOST_* namespace):
-//   MADEIRA_UBI_HOST_LAUNCH      "1" = run the launch phase
-//   MADEIRA_UBI_HOST_GAME_ID     Ubisoft numeric game ID (fallback if the
-//                                handoff is absent; the handoff wins)
-//   MADEIRA_UBI_HOST_LAUNCH_MODE "1" = multiplayer, else singleplayer
+//   MADEIRA_UBI_HOST_PREPARE      "1" = run the prepare phase
 //   MADEIRA_UBI_HOST_CLIENT_DIR  Connect install dir
 //                                (default "C:\\Program Files (x86)\\Ubisoft\\Ubisoft Game Launcher")
 //   MADEIRA_UBI_HOST_LOG         report file path
-//   MADEIRA_DOCK_AUTH_FILE       one-use MUBI0001 handoff path
+//   MADEIRA_DOCK_AUTH_FILE       one-use MUBI0001 handoff path (optional;
+//                                reserved for future session-ticket injection)
 //
 // A named mutex (Local\MadeiraUbiHost) prevents concurrent runs.
-// Terminal report: probe-result=<code> (0 = success).
+// Terminal report: probe-result=<code> (0 = ready).
 #include "dock_ubi.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,12 +74,11 @@ int main(void)
         }
     }
 
-    if (enabled("MADEIRA_UBI_HOST_LAUNCH")) {
-        unsigned mode = enabled("MADEIRA_UBI_HOST_LAUNCH_MODE") ? 1u : 0u;
+    if (enabled("MADEIRA_UBI_HOST_PREPARE")) {
         client_dir = getenv_d("MADEIRA_UBI_HOST_CLIENT_DIR",
                               "C:\\Program Files (x86)\\Ubisoft\\Ubisoft Game Launcher");
-        result = ubi_launch(&auth, client_dir, mode);
-        ubi_report("ml120", "launch-result", result);
+        result = ubi_prepare(&auth, client_dir);
+        ubi_report("ml120", "prepare-result", result);
     }
 
     ubi_report("ml999", "probe-result", result);

@@ -59,10 +59,10 @@ int ubi_auth_consume(const char *path, ubi_auth_t *out);
 void ubi_auth_free(ubi_auth_t *a);
 
 // ---------------------------------------------------------------------------
-// Launch: ensure upc.exe is running, then ShellExecute the uplay:// URL.
-// Returns a numeric result code (0 = URL fired; see launch.h for codes).
+// Prepare: ensure upc.exe is running and ready. The Steam Dock launches the
+// game afterwards; the game's uplay_r1.dll talks to this client for DRM.
+// Returns a numeric result code (0 = ready; see launch.c for codes).
 // ---------------------------------------------------------------------------
-int ubi_launch(const ubi_auth_t *auth, const char *client_dir,
-               unsigned mode /* 0 = singleplayer, 1 = multiplayer */);
+int ubi_prepare(const ubi_auth_t *auth, const char *client_dir);
 
 #endif // DOCK_UBI_H
