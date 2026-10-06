@@ -94,7 +94,7 @@ final class UbisoftDock {
         var data = envelope(session: session, gameID: game.id)
         defer { data.resetBytes(in: data.startIndex..<data.endIndex) }
         let fm = FileManager.default
-        let folder = url.deletingLastPathComponent()
+        var folder = url.deletingLastPathComponent()
         try fm.createDirectory(at: folder, withIntermediateDirectories: true,
                                attributes: [.posixPermissions: 0o700,
                                             .protectionKey: FileProtectionType.complete])
