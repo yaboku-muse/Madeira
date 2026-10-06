@@ -90,7 +90,7 @@ jobs:
         run: bash build/ci/native-runtime.sh
       - name: Pack runtime outputs
         run: |
-          tar -czf native-runtime.tar.gz app/Madeira/lib*.a app/Madeira/arm64ec-windows/ntdll.dll app/Madeira/arm64ec-windows/dockhost.exe app/Madeira/arm64ec-windows/dock-notices.txt app/Madeira/legal/LICENSES-rppairing-crates.txt
+          tar -czf native-runtime.tar.gz app/Madeira/lib*.a app/Madeira/arm64ec-windows/ntdll.dll app/Madeira/arm64ec-windows/dockhost.exe app/Madeira/arm64ec-windows/dockhost-ubi.exe app/Madeira/arm64ec-windows/dock-notices.txt app/Madeira/legal/LICENSES-rppairing-crates.txt
       - uses: actions/upload-artifact@v4
         with:
           name: native-runtime

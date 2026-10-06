@@ -3329,7 +3329,17 @@ struct ContentView: View {
                 width = size[0]; height = size[1]
             }
             setenv("MADEIRA_EXE", "explorer.exe", 1)
-            setenv("MADEIRA_ARGS", MadeiraDock.launchArguments(width: width, height: height, installers: DockInstallers.script), 1)
+            // Ubisoft games: prepare Connect first (chained in the same session),
+            // then the Steam host launches the game.
+            let needsUbi = UbisoftDock.needsUbisoftConnect(appID: game.id, installPath: launchFolder.path)
+            if needsUbi {
+                UbisoftDock.configurePrepare()
+                logStore.log("[madeira-dock] Ubisoft game detected; Connect prepare will run before the Steam host")
+            }
+            let args = needsUbi
+                ? MadeiraDock.launchArgumentsUbisoft(width: width, height: height, installers: DockInstallers.script)
+                : MadeiraDock.launchArguments(width: width, height: height, installers: DockInstallers.script)
+            setenv("MADEIRA_ARGS", args, 1)
             setenv("MADEIRA_DESKTOP", "1", 1)
             setenv("MADEIRA_SCREEN_W", String(width), 1)
             setenv("MADEIRA_SCREEN_H", String(height), 1)

@@ -615,6 +615,17 @@ enum MadeiraDock {
         return "/desktop=madeira,\(width)x\(height) C:\\windows\\system32\\cmd.exe /c call \(installers) & \(executable)"
     }
 
+    /// Launch args for Ubisoft games: dockhost-ubi.exe runs first (blocking)
+    /// to get Ubisoft Connect running, then the Steam host launches the game.
+    /// Same Wine session, same prefix — the game's uplay_r1.dll finds the
+    /// already-running client.
+    static func launchArgumentsUbisoft(width: Int, height: Int, installers: String? = nil) -> String {
+        let ubi = "C:\\windows\\system32\\dockhost-ubi.exe"
+        let chained = "\(ubi) & \(executable)"
+        guard let installers else { return "/desktop=madeira,\(width)x\(height) \(chained)" }
+        return "/desktop=madeira,\(width)x\(height) C:\\windows\\system32\\cmd.exe /c call \(installers) & \(chained)"
+    }
+
     /// Set on the main actor right before a Dock launch; read (and cleared) once by the
     /// launch worker, so only that launch sees it.
     nonisolated(unsafe) private static var launchRequest: (dock: Bool, compact: Bool) = (false, false)

@@ -23,6 +23,7 @@ bash build/wine-pe/build-ntdll.sh
 # The LLVM bin directory above is for Mach-O objcopy. Select Xcode's native
 # compiler explicitly for host sanitizer tests instead of inheriting its clang.
 HOST_CC="$(xcrun --find clang)" bash build/madeira-dock/build.sh --check
+bash build/madeira-dock-ubi/build.sh
 (cd build/gnutls-ios/src && shasum -a 256 -c SHA256SUMS)
 bash build/gnutls-ios/build.sh
 bash build/ffmpeg/build.sh
